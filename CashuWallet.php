@@ -43,6 +43,16 @@ class CashuProtocolException extends CashuException
  */
 class InsufficientBalanceException extends CashuException {}
 
+/**
+ * Network/transport failure reaching the mint (DNS, TCP, TLS, timeout).
+ *
+ * Distinct from CashuProtocolException, which means the mint responded and
+ * rejected the request. Callers use this to tell "the mint is unreachable"
+ * (eligible for offline fallback) apart from "the mint said no" (a real
+ * validation/double-spend rejection that must NOT be accepted offline).
+ */
+class CashuNetworkException extends CashuException {}
+
 // ============================================================================
 // BIG INTEGER ABSTRACTION (GMP with BCMath fallback)
 // ============================================================================
@@ -701,6 +711,20 @@ class Secp256k1
     }
 
     /**
+     * Serialize a point in uncompressed form (65 bytes) as a hex string.
+     *
+     * Format: 0x04 || X (32 bytes) || Y (32 bytes). This is the encoding
+     * NUT-12's hash_e() requires (it serializes points with compressed=False
+     * and hashes the concatenated hex).
+     *
+     * @param array $point [BigInt, BigInt]
+     */
+    public static function serializeUncompressedHex(array $point): string
+    {
+        return '04' . $point[0]->toHex(64) . $point[1]->toHex(64);
+    }
+
+    /**
      * Compress a point to 33 bytes
      *
      * @param array $point [BigInt, BigInt]
@@ -929,6 +953,87 @@ class Crypto
     {
         $Y = self::hashToCurve($secret);
         return bin2hex(Secp256k1::compressPoint($Y));
+    }
+
+    /**
+     * NUT-12 hash_e: SHA-256 over the concatenated uncompressed-hex
+     * serializations of the given points (in order), hashed as a UTF-8 string.
+     *
+     * @param array $points Array of [BigInt, BigInt] points
+     * @return string Hex-encoded 32-byte digest
+     */
+    public static function hashE(array $points): string
+    {
+        $e_ = '';
+        foreach ($points as $p) {
+            $e_ .= Secp256k1::serializeUncompressedHex($p);
+        }
+        return hash('sha256', $e_);
+    }
+
+    /**
+     * Verify a NUT-12 DLEQ proof carried by a received Proof (the "Carol"
+     * case). This proves OFFLINE that the mint signed this proof with the
+     * keyset key A, without contacting the mint.
+     *
+     * IMPORTANT: this proves authenticity of the signature only. It does NOT
+     * prove the proof is unspent — double-spend detection still requires the
+     * mint (NUT-07 /v1/checkstate).
+     *
+     * Carol reconstructs the blinded values from the blinding factor r:
+     *   Y  = hash_to_curve(secret)
+     *   C' = C + r*A
+     *   B' = Y + r*G
+     *   R1 = s*G - e*A
+     *   R2 = s*B' - e*C'
+     *   valid iff  e == hash_e(R1, R2, A, C')
+     *
+     * @param string $secret The proof secret (x)
+     * @param string $C      Hex-encoded compressed unblinded signature
+     * @param string $A      Hex-encoded compressed mint public key for the amount
+     * @param string $e      Hex-encoded DLEQ challenge scalar
+     * @param string $s      Hex-encoded DLEQ response scalar
+     * @param string $r      Hex-encoded blinding factor
+     * @return bool True iff the DLEQ proof is valid
+     */
+    public static function verifyDleq(string $secret, string $C, string $A, string $e, string $s, string $r): bool
+    {
+        try {
+            $G = Secp256k1::getGenerator();
+            $A_pt = Secp256k1::decompressPoint(hex2bin($A));
+            $C_pt = Secp256k1::decompressPoint(hex2bin($C));
+            $Y = self::hashToCurve($secret);
+
+            $eScalar = BigInt::fromHex($e);
+            $sScalar = BigInt::fromHex($s);
+            $rScalar = BigInt::fromHex($r);
+
+            // C' = C + r*A
+            $Cprime = Secp256k1::pointAdd($C_pt, Secp256k1::scalarMult($rScalar, $A_pt));
+            // B' = Y + r*G
+            $Bprime = Secp256k1::pointAdd($Y, Secp256k1::scalarMult($rScalar, $G));
+
+            // R1 = s*G - e*A
+            $R1 = Secp256k1::pointSub(
+                Secp256k1::scalarMult($sScalar, $G),
+                Secp256k1::scalarMult($eScalar, $A_pt)
+            );
+            // R2 = s*B' - e*C'
+            $R2 = Secp256k1::pointSub(
+                Secp256k1::scalarMult($sScalar, $Bprime),
+                Secp256k1::scalarMult($eScalar, $Cprime)
+            );
+
+            if ($R1 === null || $R2 === null || $Cprime === null) {
+                return false;
+            }
+
+            $computed = self::hashE([$R1, $R2, $A_pt, $Cprime]);
+            return hash_equals(strtolower($e), $computed);
+        } catch (\Throwable $ex) {
+            // Any decompression / curve failure means the proof can't be verified.
+            return false;
+        }
     }
 }
 
@@ -1635,9 +1740,11 @@ class Transport
     public const TYPE_NOSTR = 'nostr';    // Nostr NIP-17
     public const TYPE_INBAND = '';        // In-band (no transport)
 
+    // Defaults let callers use the `new Transport()` + property-set idiom used
+    // throughout (e.g. createHttpPaymentRequest) as well as positional args.
     public function __construct(
-        public string $type,          // 'post', 'nostr', or '' (in-band)
-        public string $target,        // URL or npub for nostr
+        public string $type = '',     // 'post', 'nostr', or '' (in-band)
+        public string $target = '',   // URL or npub for nostr
         public array $tags = []       // Optional tags
     ) {}
 
@@ -1691,11 +1798,13 @@ class Transport
  */
 class PaymentRequest
 {
+    // Defaults let callers use the `new PaymentRequest()` + property-set idiom
+    // used by createPaymentRequest()/fromArray() as well as positional args.
     public function __construct(
-        public string $id,              // Unique request ID
-        public int $amount,             // Amount in unit
-        public string $unit,            // 'sat', 'usd', etc.
-        public array $mints,            // Accepted mint URLs
+        public string $id = '',         // Unique request ID
+        public int $amount = 0,         // Amount in unit
+        public string $unit = 'sat',    // 'sat', 'usd', etc.
+        public array $mints = [],       // Accepted mint URLs
         public ?string $memo = null,    // Description
         public ?Transport $transport = null,  // How to deliver payment
         public bool $singleUse = true   // Whether request can be used once
@@ -2307,7 +2416,7 @@ class MintClient
         // curl handle is auto-closed when it goes out of scope in PHP 8.0+
 
         if ($error) {
-            throw new CashuException("HTTP request failed: $error");
+            throw new CashuNetworkException("HTTP request failed: $error");
         }
 
         $decoded = json_decode($response, true);
@@ -2405,6 +2514,19 @@ class WalletStorage
                 data TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER
+            );
+
+            -- Cache of mint keyset public keys, so DLEQ proofs (NUT-12) can be
+            -- verified offline when the mint is unreachable. Populated on every
+            -- successful loadMint(). keys_json maps amount => compressed pubkey hex.
+            CREATE TABLE IF NOT EXISTS cashu_keyset_keys (
+                wallet_id TEXT NOT NULL,
+                keyset_id TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                keys_json TEXT NOT NULL,
+                input_fee_ppk INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(wallet_id, keyset_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_proofs_wallet_state
@@ -2717,6 +2839,68 @@ class WalletStorage
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
 
         return $row ? (int)$row['counter'] : 0;
+    }
+
+    /**
+     * Cache a keyset's public keys so DLEQ proofs can be verified offline.
+     *
+     * @param string $keysetId Keyset ID
+     * @param string $unit Currency unit
+     * @param array $keys Map of amount => compressed pubkey hex
+     * @param int $inputFeePpk Input fee (parts per thousand) for the keyset
+     */
+    public function storeKeysetKeys(string $keysetId, string $unit, array $keys, int $inputFeePpk): void
+    {
+        if (empty($keys)) {
+            return;
+        }
+        $stmt = $this->pdo->prepare("
+            INSERT OR REPLACE INTO cashu_keyset_keys
+                (wallet_id, keyset_id, unit, keys_json, input_fee_ppk, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ");
+        $stmt->execute([
+            $this->walletId,
+            $keysetId,
+            $unit,
+            json_encode($keys),
+            $inputFeePpk,
+            time(),
+        ]);
+    }
+
+    /**
+     * Load all cached keysets for this wallet (used for offline verification).
+     *
+     * @return array List of ['keyset_id', 'unit', 'keys' => [amount=>pubkey], 'input_fee_ppk']
+     */
+    public function getCachedKeysets(): array
+    {
+        $stmt = $this->pdo->prepare("
+            SELECT keyset_id, unit, keys_json, input_fee_ppk
+            FROM cashu_keyset_keys
+            WHERE wallet_id = ?
+        ");
+        $stmt->execute([$this->walletId]);
+        $out = [];
+        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+            $keys = json_decode($row['keys_json'], true);
+            if (!is_array($keys)) {
+                continue;
+            }
+            // JSON object keys are strings; normalize amounts back to int.
+            $normalized = [];
+            foreach ($keys as $amount => $pubkey) {
+                $normalized[(int)$amount] = $pubkey;
+            }
+            $out[] = [
+                'keyset_id' => $row['keyset_id'],
+                'unit' => $row['unit'],
+                'keys' => $normalized,
+                'input_fee_ppk' => (int)$row['input_fee_ppk'],
+            ];
+        }
+        return $out;
     }
 
     /**
@@ -3462,6 +3646,86 @@ class Wallet
                 }
             }
         }
+
+        // Cache keyset keys so DLEQ proofs can be verified offline later when
+        // the mint is unreachable (see verifyProofDleq / loadMintFromCache).
+        if ($this->storage !== null) {
+            foreach ($this->keysets as $keyset) {
+                if (!empty($keyset->keys)) {
+                    try {
+                        $this->storage->storeKeysetKeys(
+                            $keyset->id,
+                            $keyset->unit,
+                            $keyset->keys,
+                            $keyset->inputFeePpk
+                        );
+                    } catch (\Throwable $e) {
+                        // Caching is best-effort; never fail a live receive over it.
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Populate keysets/keys from the local cache (cashu_keyset_keys) without
+     * contacting the mint. Used when the mint is unreachable but we still want
+     * to verify DLEQ proofs offline. Returns true if any cached keys were loaded.
+     */
+    public function loadMintFromCache(): bool
+    {
+        if ($this->storage === null) {
+            return false;
+        }
+        $cached = $this->storage->getCachedKeysets();
+        if (empty($cached)) {
+            return false;
+        }
+        $this->keysets = $this->keysets ?? [];
+        $this->keys = $this->keys ?? [];
+        foreach ($cached as $row) {
+            if ($row['unit'] !== $this->unit) {
+                continue;
+            }
+            $this->keys[$row['keyset_id']] = $row['keys'];
+            $this->keysets[] = new Keyset(
+                $row['keyset_id'],
+                $row['unit'],
+                $row['keys'],
+                true,
+                $row['input_fee_ppk']
+            );
+        }
+        return !empty($this->keys);
+    }
+
+    /**
+     * Verify the NUT-12 DLEQ proof carried by a received Proof, using the
+     * mint keyset public keys currently loaded (from the mint or from cache).
+     *
+     * Returns false if the proof has no DLEQ data or the keyset key for its
+     * amount is unavailable — i.e. we cannot prove it offline.
+     *
+     * This proves the proof is authentic mint-signed ecash. It does NOT prove
+     * the proof is unspent (that needs the mint, NUT-07).
+     */
+    public function verifyProofDleq(Proof $proof): bool
+    {
+        if ($proof->dleq === null) {
+            return false;
+        }
+        if (!isset($this->keys[$proof->id][$proof->amount])) {
+            return false;
+        }
+        $A = $this->keys[$proof->id][$proof->amount];
+        return Crypto::verifyDleq(
+            $proof->secret,
+            $proof->C,
+            $A,
+            $proof->dleq->e,
+            $proof->dleq->s,
+            $proof->dleq->r
+        );
     }
 
     /**
