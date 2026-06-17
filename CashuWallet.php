@@ -2395,6 +2395,10 @@ class MintClient
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $this->timeout,
+            // Bound the TCP/TLS handshake separately from the total timeout so a
+            // mint whose connect black-holes can't consume the whole budget on
+            // the handshake (and so a hung connect fails fast).
+            CURLOPT_CONNECTTIMEOUT => min($this->timeout, 10),
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER => [
@@ -2430,7 +2434,27 @@ class MintClient
             throw new CashuProtocolException($errorMsg, $errorCode);
         }
 
-        return $decoded ?? [];
+        // A 2xx with an empty or non-JSON body is NOT success. A mint that
+        // actually signed our mint/swap but whose response was truncated or
+        // proxy-mangled would otherwise be read by callers as "zero signatures /
+        // not paid" — silently losing funds (inputs spent at the mint, outputs
+        // never recorded). Treat an undecodable 2xx body as a protocol error so
+        // the caller's pending-operation recovery path runs instead.
+        if (!is_array($decoded)) {
+            throw new CashuProtocolException(
+                "Malformed (non-JSON) response from mint on {$method} /{$path} (HTTP {$httpCode})"
+            );
+        }
+
+        // Some mints / reverse proxies return HTTP 200 carrying the NUT-00 error
+        // envelope ({"detail": ..., "code": ...}) instead of a 4xx. Surface it as
+        // a protocol error rather than treating it as a successful empty result.
+        if (array_key_exists('code', $decoded) && array_key_exists('detail', $decoded)) {
+            $errorMsg = is_array($decoded['detail']) ? json_encode($decoded['detail']) : (string)$decoded['detail'];
+            throw new CashuProtocolException($errorMsg, $decoded['code']);
+        }
+
+        return $decoded;
     }
 }
 
@@ -4102,8 +4126,8 @@ class Wallet
         $this->requireSafeState();
 
         // Validate proof states before spending
+        $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
         if ($this->storage) {
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
             $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
             foreach ($states as $secret => $state) {
                 if ($state !== ProofState::UNSPENT) {
@@ -4112,26 +4136,47 @@ class Wallet
             }
         }
 
+        // Crash/timeout safety (mirrors mint()/melt()): a swap that the mint
+        // signs but whose response we never receive would otherwise lose the
+        // new output proofs forever — their deterministic secrets exist only in
+        // the advanced counter, with no record of WHICH counters were used. We
+        // persist a pending operation BEFORE the network call so the output
+        // range is recoverable (see recoverPendingSwaps()). The op id is derived
+        // from the input secrets so a retry of the same swap re-finds it and
+        // rebuilds byte-identical outputs instead of advancing the counter again.
+        $pendingId = 'swap:' . substr(hash('sha256', implode(',', $inputSecrets)), 0, 48);
+        $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
+
         $outputs = [];
         $blindingData = [];
 
-        foreach ($amounts as $amt) {
-            // Use deterministic secrets (NUT-13)
-            $counter = $this->nextCounter($keysetId);
-            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-            $secret = $blinded['secret'];
-
-            $outputs[] = [
-                'amount' => $amt,
-                'id' => $keysetId,
-                'B_' => $blinded['B_']
-            ];
-
-            $blindingData[] = [
-                'secret' => $secret,
-                'r' => $blinded['r'],
-                'amount' => $amt
-            ];
+        if ($pending) {
+            // RETRY: rebuild blinding data from the recorded counter range.
+            $counterStart = $pending['data']['counter_start'];
+            $keysetId = $pending['data']['keyset_id'];
+            $amounts = $pending['data']['amounts'];
+            foreach ($amounts as $i => $amt) {
+                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counterStart + $i);
+                $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+            }
+        } else {
+            // FIRST ATTEMPT: advance counters, record the pending op, THEN call.
+            $counterStart = $this->getCounter($keysetId);
+            foreach ($amounts as $amt) {
+                $counter = $this->nextCounter($keysetId);
+                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
+                $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+            }
+            if ($this->storage) {
+                $this->storage->savePendingOperation($pendingId, 'swap', [
+                    'counter_start' => $counterStart,
+                    'keyset_id' => $keysetId,
+                    'amounts' => $amounts,
+                    'input_secrets' => $inputSecrets,
+                ]);
+            }
         }
 
         // Send swap request
@@ -4154,17 +4199,132 @@ class Wallet
             );
         }
 
+        // A 2xx swap MUST return one blind signature per output. Fewer (e.g. an
+        // empty {"signatures":[]} body) means we cannot reconstruct all outputs:
+        // do NOT mark inputs spent or delete the pending op — leave it for
+        // recoverPendingSwaps() to reconcile against the mint, so we never burn
+        // inputs without recording the corresponding outputs.
+        if (count($newProofs) !== count($outputs)) {
+            throw new CashuProtocolException(
+                'Swap returned ' . count($newProofs) . ' signatures for ' . count($outputs) . ' outputs'
+            );
+        }
+
         // Auto-persist proof states to storage
         if ($this->storage) {
-            // Mark input proofs as spent
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
             $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-
-            // Store new proofs
             $this->storage->storeProofs($newProofs);
+            $this->storage->deletePendingOperation($pendingId);
         }
 
         return $newProofs;
+    }
+
+    /**
+     * Reconcile swap operations that were interrupted after the pending op was
+     * recorded but before we stored the resulting proofs (crash/timeout between
+     * the swap POST and the local write). Mirrors recoverPendingMelts().
+     *
+     * For each pending swap we ask the mint whether the input proofs were
+     * spent (NUT-07 checkstate):
+     *   - SPENT  -> the swap completed at the mint; recover the output proofs
+     *               from the recorded counter range via NUT-09 restore, store
+     *               them, mark inputs spent, clear the pending op.
+     *   - UNSPENT-> the swap never reached the mint; leave inputs UNSPENT and
+     *               drop the pending op so the funds are usable again.
+     *   - unknown/unreachable -> leave the pending op for the next run.
+     *
+     * @return array{checked:int, recovered:int, restored:int, still_pending:int, errors:array}
+     */
+    public function recoverPendingSwaps(): array
+    {
+        $result = [
+            'checked' => 0,
+            'recovered' => 0,
+            'restored' => 0,
+            'still_pending' => 0,
+            'errors' => [],
+        ];
+
+        if (!$this->storage) {
+            return $result;
+        }
+
+        $pendingOps = $this->storage->getPendingOperations('swap');
+        if (empty($pendingOps)) {
+            return $result;
+        }
+
+        foreach ($pendingOps as $op) {
+            $result['checked']++;
+            $pendingId = $op['id'];
+            try {
+                $inputSecrets = $op['data']['input_secrets'] ?? [];
+                $keysetId = $op['data']['keyset_id'] ?? null;
+                $counterStart = $op['data']['counter_start'] ?? null;
+                $amounts = $op['data']['amounts'] ?? [];
+
+                if (empty($inputSecrets) || $keysetId === null || $counterStart === null || empty($amounts)) {
+                    $result['errors'][$pendingId] = 'incomplete pending swap data';
+                    continue;
+                }
+
+                $spent = $this->inputsSpentAtMint($inputSecrets);
+                if ($spent === null) {
+                    $result['still_pending']++; // inconclusive (mint unreachable)
+                    continue;
+                }
+
+                if ($spent) {
+                    // Swap was processed: recover the outputs we never stored.
+                    $toCounter = $counterStart + count($amounts);
+                    $restored = $this->restoreTokensForRange($keysetId, $counterStart, $toCounter);
+                    if (!empty($restored)) {
+                        $this->storage->storeProofs($restored);
+                    }
+                    $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
+                    $this->storage->deletePendingOperation($pendingId);
+                    $result['recovered']++;
+                } else {
+                    // Inputs untouched: the swap never landed. Make them usable.
+                    $this->storage->updateProofsState($inputSecrets, ProofState::UNSPENT);
+                    $this->storage->deletePendingOperation($pendingId);
+                    $result['restored']++;
+                }
+            } catch (\Exception $e) {
+                $result['errors'][$pendingId] = $e->getMessage();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Ask the mint whether any of the given proof secrets are SPENT (NUT-07).
+     * Returns true if at least one is spent, false if all are unspent/pending,
+     * or null when the check is inconclusive (mint unreachable / empty result).
+     */
+    private function inputsSpentAtMint(array $secrets): ?bool
+    {
+        if (empty($secrets)) {
+            return null;
+        }
+        try {
+            $Ys = array_map(fn($s) => Crypto::computeY($s), $secrets);
+            $response = $this->client->post('checkstate', ['Ys' => $Ys]);
+        } catch (\Exception $e) {
+            return null;
+        }
+        $states = $response['states'] ?? [];
+        if (empty($states)) {
+            return null;
+        }
+        foreach ($states as $st) {
+            if (strtoupper($st['state'] ?? '') === 'SPENT') {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -5315,6 +5475,9 @@ class Wallet
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 30,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
         ]);
 
         $response = curl_exec($ch);
@@ -5457,7 +5620,11 @@ class LightningAddress
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 10,
+            CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER => ['Accept: application/json'],
         ]);
 
@@ -5533,7 +5700,11 @@ class LightningAddress
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 15,
+            CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER => ['Accept: application/json'],
         ]);
 
