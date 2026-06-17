@@ -3775,6 +3775,52 @@ class Wallet
     }
 
     /**
+     * Validate a single mint blind-signature against the output we requested,
+     * BEFORE the unblinded proof is treated as money. A mint that returns a
+     * different amount/keyset than requested (compromised, buggy, or
+     * man-in-the-middle) would otherwise have us store proofs of the wrong
+     * denomination and settle the invoice anyway. When the mint includes a
+     * NUT-12 DLEQ proof we verify it too, so we fail closed rather than store a
+     * signature the mint can't prove it produced.
+     *
+     * @param array  $sig      one entry of the mint's "signatures" array
+     * @param array  $output   the requested output (keys: amount, id, B_)
+     * @param array  $blinding the matching blinding data (keys: secret, r)
+     * @param string $C         the unblinded signature (hex)
+     * @throws CashuProtocolException on any mismatch or failed DLEQ
+     */
+    private function assertValidMintSignature(array $sig, array $output, array $blinding, string $C): void
+    {
+        if ((int)($sig['amount'] ?? -1) !== (int)$output['amount']) {
+            throw new CashuProtocolException(
+                'Mint signed amount ' . ($sig['amount'] ?? 'null')
+                . ' but output requested ' . $output['amount']
+            );
+        }
+        if (($sig['id'] ?? null) !== ($output['id'] ?? null)) {
+            throw new CashuProtocolException(
+                'Mint signed with keyset ' . ($sig['id'] ?? 'null')
+                . ' but output requested ' . ($output['id'] ?? 'null')
+            );
+        }
+        // NUT-12 DLEQ is optional; verify only when the mint supplies it. r is
+        // our blinding factor; e/s come from the mint.
+        if (isset($sig['dleq']['e'], $sig['dleq']['s'])) {
+            $ok = Crypto::verifyDleq(
+                $blinding['secret'],
+                $C,
+                $this->getPublicKey($sig['id'], $sig['amount']),
+                (string)$sig['dleq']['e'],
+                (string)$sig['dleq']['s'],
+                Secp256k1::scalarToHex($blinding['r'])
+            );
+            if (!$ok) {
+                throw new CashuProtocolException('Mint DLEQ proof failed verification');
+            }
+        }
+    }
+
+    /**
      * Get input fee PPK (parts per thousand) for a keyset
      */
     public function getInputFeePpk(?string $keysetId = null): int
@@ -3901,8 +3947,16 @@ class Wallet
         // Unblind signatures to create proofs
         $proofs = [];
         foreach ($response['signatures'] ?? [] as $i => $sig) {
+            if (!isset($outputs[$i], $blindingData[$i])) {
+                throw new CashuProtocolException('Mint returned more signatures than requested outputs');
+            }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
+
+            // Verify amount/keyset (and DLEQ when present) before storing the
+            // proof; this is the LN-invoice settle path, so an unverified mint
+            // response must not settle the invoice with bad-denomination ecash.
+            $this->assertValidMintSignature($sig, $outputs[$i], $blindingData[$i], $C);
 
             $dleq = null;
             if (isset($sig['dleq'])) {
@@ -4188,8 +4242,18 @@ class Wallet
         // Unblind signatures
         $newProofs = [];
         foreach ($response['signatures'] ?? [] as $i => $sig) {
+            if (!isset($outputs[$i], $blindingData[$i])) {
+                throw new CashuProtocolException('Mint returned more signatures than requested outputs');
+            }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
+
+            // Verify the mint signed the amount/keyset we asked for (and the
+            // DLEQ when present) before treating $C as money. On failure we
+            // throw without marking inputs SPENT or deleting the pending op, so
+            // recoverPendingSwaps() reconciles against the mint rather than us
+            // burning inputs for unverifiable outputs.
+            $this->assertValidMintSignature($sig, $outputs[$i], $blindingData[$i], $C);
 
             $newProofs[] = new Proof(
                 $sig['id'],
