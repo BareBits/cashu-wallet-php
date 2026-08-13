@@ -2390,6 +2390,16 @@ class MintClient
     {
         $url = $this->mintUrl . '/v1/' . ltrim($path, '/');
 
+        // Cap the response body so a hostile or misconfigured mint can't pin a
+        // PHP-FPM worker's memory with an unbounded (multi-GB) reply. Mint URLs
+        // are merchant-configured, i.e. attacker-influenceable. 20 MB is far
+        // above any legitimate NUT-0x response (keysets, quotes, proofs) yet
+        // bounds worst-case memory. We buffer via CURLOPT_WRITEFUNCTION and
+        // bail mid-stream on overflow (same pattern as SafeHttp).
+        $maxBytes = 20 * 1024 * 1024;
+        $bodyBuf = '';
+        $exceeded = false;
+
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
@@ -2404,7 +2414,16 @@ class MintClient
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
                 'Accept: application/json'
-            ]
+            ],
+            CURLOPT_WRITEFUNCTION => function ($_ch, string $chunk) use (&$bodyBuf, &$exceeded, $maxBytes) {
+                $len = strlen($chunk);
+                if (strlen($bodyBuf) + $len > $maxBytes) {
+                    $exceeded = true;
+                    return 0; // abort transfer
+                }
+                $bodyBuf .= $chunk;
+                return $len;
+            },
         ]);
 
         if ($method === 'POST') {
@@ -2414,10 +2433,23 @@ class MintClient
             }
         }
 
-        $response = curl_exec($ch);
+        curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
         // curl handle is auto-closed when it goes out of scope in PHP 8.0+
+
+        // A CURLOPT_WRITEFUNCTION that returns 0 surfaces as a curl write
+        // error; report the size cap explicitly rather than as a generic
+        // failure so operators can tell a bloated mint from a network fault.
+        if ($exceeded) {
+            throw new CashuNetworkException(
+                "Mint response exceeded the {$maxBytes}-byte cap; refusing to buffer"
+            );
+        }
+
+        // With WRITEFUNCTION set, curl_exec no longer returns the body — read
+        // it from the buffer we accumulated.
+        $response = $bodyBuf;
 
         if ($error) {
             throw new CashuNetworkException("HTTP request failed: $error");
