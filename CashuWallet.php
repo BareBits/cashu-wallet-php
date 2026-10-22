@@ -32,9 +32,73 @@ class CashuException extends \Exception {}
  */
 class CashuProtocolException extends CashuException
 {
-    public function __construct(string $message, ?int $code = null)
+    // Standardized mint error codes (nuts/error_codes.md). getCode() returns
+    // the mint-provided code, or 0 when the mint sent none.
+    public const PROOF_VERIFICATION_FAILED = 10001;
+    public const PROOFS_ALREADY_SPENT = 11001;
+    public const PROOFS_PENDING = 11002;
+    public const OUTPUTS_ALREADY_SIGNED = 11003;
+    public const OUTPUTS_PENDING = 11004;
+    public const TRANSACTION_UNBALANCED = 11005;
+    public const KEYSET_UNKNOWN = 12001;
+    public const KEYSET_INACTIVE = 12002;
+    public const KEYSET_EXPIRED = 12003;
+    public const QUOTE_NOT_PAID = 20001;
+    public const QUOTE_ALREADY_ISSUED = 20002;
+    public const QUOTE_PENDING = 20005;
+    public const QUOTE_EXPIRED = 20007;
+
+    /** HTTP status of the reply that carried the error, when known. */
+    private ?int $httpStatus;
+
+    public function __construct(string $message, ?int $code = null, ?int $httpStatus = null)
     {
         parent::__construct($message, $code ?? 0);
+        $this->httpStatus = $httpStatus;
+    }
+
+    public function getHttpStatus(): ?int
+    {
+        return $this->httpStatus;
+    }
+
+    /**
+     * Whether the mint positively answered "no" to this request, as opposed to an
+     * ambiguous failure after which it may still have executed it.
+     *
+     * Definitive: a Cashu error code, or an HTTP 4xx other than 408/425/429. Ambiguous:
+     * 5xx (a gateway may have timed out while the mint kept going), and "pending" codes
+     * (11002 inputs, 11004 outputs, 20005 quote), which say the operation is in flight.
+     * Transport failures are CashuNetworkExceptions and never definitive.
+     *
+     * A definitive rejection proves the *rejected request* did nothing; it does not prove
+     * an earlier attempt with the same data did nothing. Callers still confirm with
+     * NUT-07/NUT-09 before releasing or replacing anything.
+     */
+    public function isDefinitive(): bool
+    {
+        if (in_array($this->getCode(), [self::PROOFS_PENDING, self::OUTPUTS_PENDING, self::QUOTE_PENDING], true)) {
+            return false;
+        }
+        $status = $this->httpStatus;
+        if ($status !== null) {
+            if ($status >= 500 || in_array($status, [408, 425, 429], true)) {
+                return false;
+            }
+            return $status >= 400;
+        }
+        return $this->getCode() > 0;
+    }
+
+    /** The mint does not know the quote (HTTP 404 or a "quote not found" rejection). */
+    public function isQuoteNotFound(): bool
+    {
+        if ($this->httpStatus === 404) {
+            return true;
+        }
+        return $this->isDefinitive()
+            && preg_match('/quote[^.]{0,40}(not found|does not exist|unknown)|unknown quote|no such quote/i',
+                $this->getMessage()) === 1;
     }
 }
 
@@ -128,7 +192,7 @@ class BigInt
         $len = strlen($hex);
         for ($i = 0; $i < $len; $i++) {
             $digit = strpos('0123456789abcdef', $hex[$i]);
-            $dec = bcadd(bcmul($dec, '16'), (string)$digit);
+            $dec = bcadd(bcmul($dec, '16', 0), (string)$digit, 0);
         }
         return new self($dec);
     }
@@ -176,7 +240,7 @@ class BigInt
         if (self::$useGmp) {
             return new self(gmp_add($this->value, $other->value));
         }
-        return new self(bcadd($this->value, $other->value));
+        return new self(bcadd($this->value, $other->value, 0));
     }
 
     /**
@@ -187,7 +251,7 @@ class BigInt
         if (self::$useGmp) {
             return new self(gmp_sub($this->value, $other->value));
         }
-        return new self(bcsub($this->value, $other->value));
+        return new self(bcsub($this->value, $other->value, 0));
     }
 
     /**
@@ -198,7 +262,7 @@ class BigInt
         if (self::$useGmp) {
             return new self(gmp_mul($this->value, $other->value));
         }
-        return new self(bcmul($this->value, $other->value));
+        return new self(bcmul($this->value, $other->value, 0));
     }
 
     /**
@@ -211,9 +275,9 @@ class BigInt
         }
 
         // BCMath mod that handles negative numbers correctly
-        $result = bcmod($this->value, $m->value);
-        if (bccomp($result, '0') < 0) {
-            $result = bcadd($result, $m->value);
+        $result = bcmod($this->value, $m->value, 0);
+        if (bccomp($result, '0', 0) < 0) {
+            $result = bcadd($result, $m->value, 0);
         }
         return new self($result);
     }
@@ -226,7 +290,7 @@ class BigInt
         if (self::$useGmp) {
             return new self(gmp_pow($this->value, $exp));
         }
-        return new self(bcpow($this->value, (string)$exp));
+        return new self(bcpow($this->value, (string)$exp, 0));
     }
 
     /**
@@ -248,15 +312,15 @@ class BigInt
     private static function bcPowMod(string $base, string $exp, string $mod): self
     {
         $result = '1';
-        $base = bcmod($base, $mod);
+        $base = bcmod($base, $mod, 0);
 
-        while (bccomp($exp, '0') > 0) {
+        while (bccomp($exp, '0', 0) > 0) {
             // If exp is odd, multiply result by base
-            if (bcmod($exp, '2') === '1') {
-                $result = bcmod(bcmul($result, $base), $mod);
+            if (bcmod($exp, '2', 0) === '1') {
+                $result = bcmod(bcmul($result, $base, 0), $mod, 0);
             }
             $exp = bcdiv($exp, '2', 0);
-            $base = bcmod(bcmul($base, $base), $mod);
+            $base = bcmod(bcmul($base, $base, 0), $mod, 0);
         }
 
         return new self($result);
@@ -281,7 +345,7 @@ class BigInt
         if (self::$useGmp) {
             return new self(gmp_neg($this->value));
         }
-        return new self(bcmul($this->value, '-1'));
+        return new self(bcmul($this->value, '-1', 0));
     }
 
     /**
@@ -292,7 +356,7 @@ class BigInt
         if (self::$useGmp) {
             return new self(gmp_div_q($this->value, gmp_pow(2, $bits)));
         }
-        return new self(bcdiv($this->value, bcpow('2', (string)$bits), 0));
+        return new self(bcdiv($this->value, bcpow('2', (string)$bits, 0), 0));
     }
 
     // ========================================================================
@@ -308,7 +372,7 @@ class BigInt
         if (self::$useGmp) {
             return gmp_cmp($this->value, $other->value);
         }
-        return bccomp($this->value, $other->value);
+        return bccomp($this->value, $other->value, 0);
     }
 
     /**
@@ -358,16 +422,16 @@ class BigInt
             $hex = '';
             $val = $this->value;
 
-            if (bccomp($val, '0') === 0) {
+            if (bccomp($val, '0', 0) === 0) {
                 $hex = '0';
             } else {
-                $isNegative = bccomp($val, '0') < 0;
+                $isNegative = bccomp($val, '0', 0) < 0;
                 if ($isNegative) {
-                    $val = bcmul($val, '-1');
+                    $val = bcmul($val, '-1', 0);
                 }
 
-                while (bccomp($val, '0') > 0) {
-                    $remainder = bcmod($val, '16');
+                while (bccomp($val, '0', 0) > 0) {
+                    $remainder = bcmod($val, '16', 0);
                     $hex = '0123456789abcdef'[(int)$remainder] . $hex;
                     $val = bcdiv($val, '16', 0);
                 }
@@ -421,7 +485,7 @@ class BigInt
             throw new CashuException('Modular inverse does not exist');
         }
 
-        $inv = bcmod(bcadd($result['s'], $m->value), $m->value);
+        $inv = bcmod(bcadd($result['s'], $m->value, 0), $m->value, 0);
         return new self($inv);
     }
 
@@ -439,19 +503,19 @@ class BigInt
         $old_t = '0';
         $t = '1';
 
-        while (bccomp($r, '0') !== 0) {
+        while (bccomp($r, '0', 0) !== 0) {
             $q = bcdiv($old_r, $r, 0);
 
             $temp = $r;
-            $r = bcsub($old_r, bcmul($q, $r));
+            $r = bcsub($old_r, bcmul($q, $r, 0), 0);
             $old_r = $temp;
 
             $temp = $s;
-            $s = bcsub($old_s, bcmul($q, $s));
+            $s = bcsub($old_s, bcmul($q, $s, 0), 0);
             $old_s = $temp;
 
             $temp = $t;
-            $t = bcsub($old_t, bcmul($q, $t));
+            $t = bcsub($old_t, bcmul($q, $t, 0), 0);
             $old_t = $temp;
         }
 
@@ -494,13 +558,13 @@ class BigInt
      */
     private static function decToBin(string $dec): string
     {
-        if (bccomp($dec, '0') === 0) {
+        if (bccomp($dec, '0', 0) === 0) {
             return '0';
         }
 
         $bin = '';
-        while (bccomp($dec, '0') > 0) {
-            $bin = bcmod($dec, '2') . $bin;
+        while (bccomp($dec, '0', 0) > 0) {
+            $bin = bcmod($dec, '2', 0) . $bin;
             $dec = bcdiv($dec, '2', 0);
         }
 
@@ -515,9 +579,9 @@ class BigInt
         $dec = '0';
         $len = strlen($bin);
         for ($i = 0; $i < $len; $i++) {
-            $dec = bcmul($dec, '2');
+            $dec = bcmul($dec, '2', 0);
             if ($bin[$i] === '1') {
-                $dec = bcadd($dec, '1');
+                $dec = bcadd($dec, '1', 0);
             }
         }
         return $dec;
@@ -998,6 +1062,20 @@ class Crypto
      */
     public static function verifyDleq(string $secret, string $C, string $A, string $e, string $s, string $r): bool
     {
+        // e, s and r are 32-byte scalars. An unbounded string would reach
+        // BigInt::fromHex(), which is quadratic on the BCMath backend, so one
+        // crafted proof could cost minutes of CPU. Anything that is not 1-64 hex
+        // characters is not a valid scalar; shorter values (leading zeroes
+        // omitted by some wallets) are padded to the 32-byte width first.
+        if (!self::isDleqScalar($e) || !self::isDleqScalar($s) || !self::isDleqScalar($r)) {
+            return false;
+        }
+        $e = str_pad(strtolower($e), 64, '0', STR_PAD_LEFT);
+        $s = str_pad(strtolower($s), 64, '0', STR_PAD_LEFT);
+        $r = str_pad(strtolower($r), 64, '0', STR_PAD_LEFT);
+        if (strlen($A) !== 66 || !ctype_xdigit($A) || strlen($C) !== 66 || !ctype_xdigit($C)) {
+            return false;
+        }
         try {
             $G = Secp256k1::getGenerator();
             $A_pt = Secp256k1::decompressPoint(hex2bin($A));
@@ -1034,6 +1112,16 @@ class Crypto
             // Any decompression / curve failure means the proof can't be verified.
             return false;
         }
+    }
+
+    /**
+     * A NUT-12 scalar: at most 32 bytes, written as hex (1-64 hex characters;
+     * leading zeroes may be omitted). The upper bound keeps a huge value out of
+     * the quadratic BCMath parser.
+     */
+    public static function isDleqScalar(mixed $value): bool
+    {
+        return is_string($value) && $value !== '' && strlen($value) <= 64 && ctype_xdigit($value);
     }
 }
 
@@ -1638,6 +1726,38 @@ class Keyset
 }
 
 /**
+ * Typed reads of mint response fields: a wrong JSON type is a CashuException,
+ * never a TypeError escaping from a typed constructor under strict_types.
+ */
+final class MintResponseField
+{
+    /** Non-negative integer (a JSON int or a digit string), null when absent. */
+    public static function int(array $data, string $key, string $what): ?int
+    {
+        $v = $data[$key] ?? null;
+        if ($v === null) {
+            return null;
+        }
+        if (is_int($v) && $v >= 0) {
+            return $v;
+        }
+        if (is_string($v) && $v !== '' && ctype_digit($v) && strlen($v) <= 18) {
+            return (int)$v;
+        }
+        throw new CashuException("Mint returned a malformed $what ($key)");
+    }
+
+    public static function string(array $data, string $key, string $what): ?string
+    {
+        $v = $data[$key] ?? null;
+        if ($v === null || is_string($v)) {
+            return $v;
+        }
+        throw new CashuException("Mint returned a malformed $what ($key)");
+    }
+}
+
+/**
  * Mint quote response
  */
 class MintQuote
@@ -1653,13 +1773,18 @@ class MintQuote
 
     public static function fromArray(array $data): self
     {
+        if (!isset($data['quote'], $data['request'])
+            || !is_string($data['quote']) || !is_string($data['request'])) {
+            throw new CashuException('Mint returned a malformed mint quote');
+        }
+        $f = 'mint quote';
         return new self(
             $data['quote'],
             $data['request'],
-            $data['amount'] ?? 0,
-            $data['state'] ?? 'UNPAID',
-            $data['expiry'] ?? null,
-            $data['unit'] ?? null
+            MintResponseField::int($data, 'amount', $f) ?? 0,
+            MintResponseField::string($data, 'state', $f) ?? 'UNPAID',
+            MintResponseField::int($data, 'expiry', $f),
+            MintResponseField::string($data, 'unit', $f)
         );
     }
 
@@ -1693,16 +1818,31 @@ class MeltQuote
 
     public static function fromArray(array $data): self
     {
+        if (!isset($data['quote']) || !is_string($data['quote']) || !isset($data['amount'])) {
+            throw new CashuException('Mint returned a malformed melt quote');
+        }
+        // A response without `state` used to become UNPAID, and an expired "unpaid" quote
+        // is grounds for releasing its reserved inputs — so a field the mint simply did
+        // not send could hand back proofs that are in flight. Absent state stays unknown.
+        $state = isset($data['state']) && is_string($data['state'])
+            ? strtoupper($data['state'])
+            : ProofState::UNKNOWN;
+
+        $f = 'melt quote';
+        $change = $data['change'] ?? null;
+        if ($change !== null && !is_array($change)) {
+            throw new CashuException('Mint returned a malformed melt quote (change)');
+        }
         return new self(
             $data['quote'],
-            $data['amount'],
-            $data['fee_reserve'] ?? 0,
-            $data['state'] ?? 'UNPAID',
-            $data['expiry'] ?? null,
-            $data['payment_preimage'] ?? null,
-            $data['change'] ?? null,
-            $data['unit'] ?? null,
-            $data['request'] ?? null
+            MintResponseField::int($data, 'amount', $f),
+            MintResponseField::int($data, 'fee_reserve', $f) ?? 0,
+            $state,
+            MintResponseField::int($data, 'expiry', $f),
+            MintResponseField::string($data, 'payment_preimage', $f),
+            $change,
+            MintResponseField::string($data, 'unit', $f),
+            MintResponseField::string($data, 'request', $f)
         );
     }
 
@@ -1715,6 +1855,12 @@ class MeltQuote
     {
         return strtoupper($this->state) === 'PENDING';
     }
+
+    /** True only for an explicit UNPAID from the mint. */
+    public function isUnpaid(): bool
+    {
+        return strtoupper($this->state) === 'UNPAID';
+    }
 }
 
 /**
@@ -1725,6 +1871,29 @@ class ProofState
     const UNSPENT = 'UNSPENT';
     const PENDING = 'PENDING';
     const SPENT = 'SPENT';
+
+    /**
+     * Handed to a third party (exported token, donation, tip). Unlike PENDING, this is
+     * never reclaimed automatically by recovery code: the mint reporting the proof as
+     * UNSPENT only means the recipient has not redeemed it *yet*. Never spendable.
+     */
+    const EXPORTED = 'EXPORTED';
+
+    /** State could not be established. Never selectable for spending. */
+    const UNKNOWN = 'UNKNOWN';
+
+    /** States that may be spent by this wallet. */
+    const SPENDABLE = [self::UNSPENT];
+
+    public static function all(): array
+    {
+        return [self::UNSPENT, self::PENDING, self::SPENT, self::EXPORTED, self::UNKNOWN];
+    }
+
+    public static function isValid(string $state): bool
+    {
+        return in_array($state, self::all(), true);
+    }
 }
 
 // ============================================================================
@@ -1979,8 +2148,18 @@ class CBOR
     public static function decode(string $data)
     {
         $offset = 0;
-        return self::decodeValue($data, $offset);
+        $value = self::decodeValue($data, $offset, 0);
+        if ($offset !== strlen($data)) {
+            throw new CashuException('CBOR: Trailing data after the top-level item');
+        }
+        return $value;
     }
+
+    /** Deepest nesting accepted while decoding; guards against stack exhaustion. */
+    private const MAX_DEPTH = 16;
+
+    /** Most entries accepted in one map while decoding. */
+    private const MAX_MAP_ENTRIES = 64;
 
     private static function encodeUnsigned(int $value): string
     {
@@ -2038,8 +2217,11 @@ class CBOR
         }
     }
 
-    private static function decodeValue(string $data, int &$offset)
+    private static function decodeValue(string $data, int &$offset, int $depth = 0)
     {
+        if ($depth > self::MAX_DEPTH) {
+            throw new CashuException('CBOR: Nesting too deep');
+        }
         if ($offset >= strlen($data)) {
             throw new CashuException('CBOR: Unexpected end of data');
         }
@@ -2059,27 +2241,47 @@ class CBOR
                 return -1 - $value;
 
             case self::BYTE_STRING:
-                $result = substr($data, $offset, $value);
-                $offset += $value;
-                return $result;
-
             case self::TEXT_STRING:
+                // Reject a declared length longer than what is left before allocating:
+                // substr() would otherwise silently return a short string.
+                if ($value > strlen($data) - $offset) {
+                    throw new CashuException('CBOR: String length exceeds the remaining data');
+                }
                 $result = substr($data, $offset, $value);
                 $offset += $value;
                 return $result;
 
             case self::ARRAY:
+                // Every element costs at least one byte, so a count larger than the
+                // remaining input can never be satisfied. Check first so a bogus header
+                // cannot make us loop (or allocate) for a very long time.
+                if ($value > strlen($data) - $offset) {
+                    throw new CashuException('CBOR: Array length exceeds the remaining data');
+                }
                 $result = [];
                 for ($i = 0; $i < $value; $i++) {
-                    $result[] = self::decodeValue($data, $offset);
+                    $result[] = self::decodeValue($data, $offset, $depth + 1);
                 }
                 return $result;
 
             case self::MAP:
+                // Token and payment-request maps have a handful of fields; a large map
+                // is only ever an attempt to make us build a huge array.
+                if ($value > self::MAX_MAP_ENTRIES) {
+                    throw new CashuException('CBOR: Map has too many entries');
+                }
+                if ($value > intdiv(strlen($data) - $offset, 2)) {
+                    throw new CashuException('CBOR: Map length exceeds the remaining data');
+                }
                 $result = [];
                 for ($i = 0; $i < $value; $i++) {
-                    $key = self::decodeValue($data, $offset);
-                    $result[$key] = self::decodeValue($data, $offset);
+                    $key = self::decodeValue($data, $offset, $depth + 1);
+                    // Text keys only: the encoder writes nothing else, and an integer or
+                    // array key would collide with (or be coerced into) a string one.
+                    if (!is_string($key)) {
+                        throw new CashuException('CBOR: Map keys must be strings');
+                    }
+                    $result[$key] = self::decodeValue($data, $offset, $depth + 1);
                 }
                 return $result;
 
@@ -2103,26 +2305,30 @@ class CBOR
             return $additionalInfo;
         }
 
-        switch ($additionalInfo) {
-            case 24:
-                $value = ord($data[$offset]);
-                $offset += 1;
-                return $value;
-            case 25:
-                $value = unpack('n', substr($data, $offset, 2))[1];
-                $offset += 2;
-                return $value;
-            case 26:
-                $value = unpack('N', substr($data, $offset, 4))[1];
-                $offset += 4;
-                return $value;
-            case 27:
-                $value = unpack('J', substr($data, $offset, 8))[1];
-                $offset += 8;
-                return $value;
+        $width = match ($additionalInfo) {
+            24 => 1,
+            25 => 2,
+            26 => 4,
+            27 => 8,
+            default => throw new CashuException('CBOR: Invalid length encoding'),
+        };
+        if (strlen($data) - $offset < $width) {
+            throw new CashuException('CBOR: Unexpected end of data');
         }
-
-        throw new CashuException('CBOR: Invalid length encoding');
+        $raw = substr($data, $offset, $width);
+        $offset += $width;
+        $value = match ($width) {
+            1 => ord($raw),
+            2 => unpack('n', $raw)[1],
+            4 => unpack('N', $raw)[1],
+            8 => unpack('J', $raw)[1],
+        };
+        // 'J' wraps past PHP_INT_MAX into a negative int; a negative length would make
+        // every downstream bounds check pass and then produce nonsense.
+        if ($value < 0) {
+            throw new CashuException('CBOR: Length out of range');
+        }
+        return $value;
     }
 
     private static function isAssoc(array $arr): bool
@@ -2259,18 +2465,86 @@ class TokenSerializer
         return strlen($id) === 16 && ctype_xdigit($id);
     }
 
+    /** Largest token string accepted, before base64 decoding. */
+    public const MAX_TOKEN_LENGTH = 262144;
+
+    /** Largest number of proofs accepted in one token. */
+    public const MAX_PROOFS = 1000;
+
     /**
      * Deserialize a token string
+     *
+     * Tokens arrive from strangers, so every structural assumption is checked here and
+     * anything unexpected becomes a CashuException. Callers must never see a TypeError
+     * or a PHP warning from a malformed token.
+     *
+     * @throws CashuException If the token is not well-formed
      */
     public static function deserialize(string $tokenString): Token
     {
-        if (str_starts_with($tokenString, 'cashuA')) {
-            return self::deserializeV3($tokenString);
-        } elseif (str_starts_with($tokenString, 'cashuB')) {
-            return self::deserializeV4($tokenString);
+        $tokenString = trim($tokenString);
+        if (strlen($tokenString) > self::MAX_TOKEN_LENGTH) {
+            throw new CashuException('Invalid token: too large');
+        }
+
+        try {
+            if (str_starts_with($tokenString, 'cashuA')) {
+                return self::deserializeV3($tokenString);
+            }
+            if (str_starts_with($tokenString, 'cashuB')) {
+                return self::deserializeV4($tokenString);
+            }
+        } catch (CashuException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new CashuException('Invalid token: ' . $e->getMessage());
         }
 
         throw new CashuException('Unknown token format');
+    }
+
+    /** Strict base64url decode of the part after the "cashuA"/"cashuB" prefix. */
+    private static function decodePayload(string $tokenString): string
+    {
+        $body = substr($tokenString, 6);
+        if ($body === '' || strspn($body, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=') !== strlen($body)) {
+            throw new CashuException('Invalid token: not base64url');
+        }
+        $base64 = rtrim(strtr($body, '-_', '+/'), '=');
+        $base64 = str_pad($base64, strlen($base64) + (4 - strlen($base64) % 4) % 4, '=');
+        $decoded = base64_decode($base64, true);
+        if ($decoded === false || $decoded === '') {
+            throw new CashuException('Invalid token: not base64url');
+        }
+        return $decoded;
+    }
+
+    /** Validate one decoded proof and normalize it into a Proof object. */
+    private static function proofFromParts(
+        string $keysetId,
+        $amount,
+        $secret,
+        string $C,
+        ?DLEQWallet $dleq,
+        $witness
+    ): Proof {
+        if (!self::isHexKeysetId($keysetId) && !(strlen($keysetId) === 12 && base64_decode(strtr($keysetId, '-_', '+/'), true) !== false)) {
+            throw new CashuException('Invalid token: malformed keyset ID');
+        }
+        if (!is_int($amount) || $amount <= 0 || $amount > 2 ** 53) {
+            throw new CashuException('Invalid token: proof amount must be a positive integer');
+        }
+        if (!is_string($secret) || $secret === '' || strlen($secret) > 1024) {
+            throw new CashuException('Invalid token: malformed proof secret');
+        }
+        if (strlen($C) !== 66 || !ctype_xdigit($C)) {
+            throw new CashuException('Invalid token: malformed proof signature');
+        }
+        if ($witness !== null && !is_string($witness)) {
+            throw new CashuException('Invalid token: malformed witness');
+        }
+
+        return new Proof($keysetId, $amount, $secret, strtolower($C), $dleq, $witness);
     }
 
     /**
@@ -2278,27 +2552,70 @@ class TokenSerializer
      */
     private static function deserializeV3(string $tokenString): Token
     {
-        $base64 = substr($tokenString, 6);
-        $base64 = strtr($base64, '-_', '+/');
-        $base64 = str_pad($base64, strlen($base64) + (4 - strlen($base64) % 4) % 4, '=');
-
-        $json = base64_decode($base64);
+        $json = self::decodePayload($tokenString);
         $data = json_decode($json, true);
 
-        if (!isset($data['token']) || empty($data['token'])) {
+        if (!is_array($data) || !isset($data['token']) || !is_array($data['token']) || empty($data['token'])) {
             throw new CashuException('Invalid V3 token: missing token data');
         }
 
-        $firstToken = $data['token'][0];
-        $mint = $firstToken['mint'] ?? '';
+        // A V3 token may name several mints. Merging them under the first mint (as this
+        // used to do) would send one mint's proofs to another, so refuse instead.
+        $mints = [];
+        foreach ($data['token'] as $tokenPart) {
+            if (!is_array($tokenPart) || !isset($tokenPart['mint']) || !is_string($tokenPart['mint'])) {
+                throw new CashuException('Invalid V3 token: malformed token part');
+            }
+            $mints[rtrim($tokenPart['mint'], '/')] = true;
+        }
+        if (count($mints) > 1) {
+            throw new CashuException('Invalid token: multi-mint V3 tokens are not supported');
+        }
+
+        $mint = $data['token'][0]['mint'];
         $unit = $data['unit'] ?? 'sat';
         $memo = $data['memo'] ?? null;
+        if (!is_string($unit) || !is_string($mint) || ($memo !== null && !is_string($memo))) {
+            throw new CashuException('Invalid V3 token: malformed header fields');
+        }
 
         $proofs = [];
         foreach ($data['token'] as $tokenPart) {
-            foreach ($tokenPart['proofs'] ?? [] as $proofData) {
-                $proofs[] = Proof::fromArray($proofData);
+            $partProofs = $tokenPart['proofs'] ?? [];
+            if (!is_array($partProofs)) {
+                throw new CashuException('Invalid V3 token: malformed proof list');
             }
+            foreach ($partProofs as $proofData) {
+                if (!is_array($proofData) || !isset($proofData['id'], $proofData['secret'], $proofData['C'])
+                    || !is_string($proofData['id']) || !is_string($proofData['C'])) {
+                    throw new CashuException('Invalid V3 token: malformed proof');
+                }
+                $dleq = null;
+                if (isset($proofData['dleq']) && is_array($proofData['dleq'])
+                    && isset($proofData['dleq']['e'], $proofData['dleq']['s'])
+                    && is_string($proofData['dleq']['e']) && is_string($proofData['dleq']['s'])) {
+                    $r = $proofData['dleq']['r'] ?? null;
+                    $dleq = new DLEQWallet(
+                        $proofData['dleq']['e'],
+                        $proofData['dleq']['s'],
+                        is_string($r) ? $r : ''
+                    );
+                }
+                $proofs[] = self::proofFromParts(
+                    $proofData['id'],
+                    $proofData['amount'] ?? null,
+                    $proofData['secret'],
+                    $proofData['C'],
+                    $dleq,
+                    $proofData['witness'] ?? null
+                );
+                if (count($proofs) > self::MAX_PROOFS) {
+                    throw new CashuException('Invalid token: too many proofs');
+                }
+            }
+        }
+        if (empty($proofs)) {
+            throw new CashuException('Invalid token: no proofs');
         }
 
         return new Token($mint, $unit, $proofs, $memo);
@@ -2309,39 +2626,59 @@ class TokenSerializer
      */
     private static function deserializeV4(string $tokenString): Token
     {
-        $base64 = substr($tokenString, 6);
-        $base64 = strtr($base64, '-_', '+/');
-        $base64 = str_pad($base64, strlen($base64) + (4 - strlen($base64) % 4) % 4, '=');
+        $data = CBOR::decode(self::decodePayload($tokenString));
 
-        $cbor = base64_decode($base64);
-        $data = CBOR::decode($cbor);
-
-        $mint = $data['m'] ?? '';
+        if (!is_array($data) || !isset($data['m']) || !is_string($data['m'])) {
+            throw new CashuException('Invalid V4 token: missing mint');
+        }
+        $mint = $data['m'];
         $unit = $data['u'] ?? 'sat';
         $memo = $data['d'] ?? null;
+        if (!is_string($unit) || ($memo !== null && !is_string($memo))) {
+            throw new CashuException('Invalid V4 token: malformed header fields');
+        }
+        $parts = $data['t'] ?? null;
+        if (!is_array($parts) || empty($parts)) {
+            throw new CashuException('Invalid V4 token: missing proofs');
+        }
 
         $proofs = [];
-        foreach ($data['t'] ?? [] as $tokenPart) {
+        foreach ($parts as $tokenPart) {
+            if (!is_array($tokenPart) || !isset($tokenPart['i']) || !is_string($tokenPart['i'])) {
+                throw new CashuException('Invalid V4 token: malformed keyset ID');
+            }
             $keysetId = bin2hex($tokenPart['i']);
+            $partProofs = $tokenPart['p'] ?? null;
+            if (!is_array($partProofs) || empty($partProofs)) {
+                throw new CashuException('Invalid V4 token: malformed proof list');
+            }
 
-            foreach ($tokenPart['p'] ?? [] as $p) {
+            foreach ($partProofs as $proof) {
+                if (!is_array($proof) || !isset($proof['s'], $proof['c'])
+                    || !is_string($proof['s']) || !is_string($proof['c'])) {
+                    throw new CashuException('Invalid V4 token: malformed proof');
+                }
                 $dleq = null;
-                if (isset($p['d'])) {
-                    $dleq = new DLEQWallet(
-                        bin2hex($p['d']['e']),
-                        bin2hex($p['d']['s']),
-                        bin2hex($p['d']['r'])
-                    );
+                if (isset($proof['d'])) {
+                    $d = $proof['d'];
+                    if (!is_array($d) || !isset($d['e'], $d['s'], $d['r'])
+                        || !is_string($d['e']) || !is_string($d['s']) || !is_string($d['r'])) {
+                        throw new CashuException('Invalid V4 token: malformed DLEQ proof');
+                    }
+                    $dleq = new DLEQWallet(bin2hex($d['e']), bin2hex($d['s']), bin2hex($d['r']));
                 }
 
-                $proofs[] = new Proof(
+                $proofs[] = self::proofFromParts(
                     $keysetId,
-                    $p['a'],
-                    $p['s'],
-                    bin2hex($p['c']),
+                    $proof['a'] ?? null,
+                    $proof['s'],
+                    bin2hex($proof['c']),
                     $dleq,
-                    $p['w'] ?? null
+                    $proof['w'] ?? null
                 );
+                if (count($proofs) > self::MAX_PROOFS) {
+                    throw new CashuException('Invalid token: too many proofs');
+                }
             }
         }
 
@@ -2354,6 +2691,60 @@ class TokenSerializer
 // ============================================================================
 
 /**
+ * Optional address policy for the library's own outbound requests.
+ *
+ * Mint URLs arrive from tokens and payment requests, LNURL endpoints from whoever owns
+ * a Lightning address. The library cannot know which networks the host application
+ * considers off limits, so the application installs a guard that resolves the host,
+ * refuses what it must not reach and returns CURLOPT_RESOLVE pins, so libcurl connects
+ * to exactly the addresses that were checked (no DNS rebinding between check and use).
+ *
+ * A refusal is a plain CashuException (never CashuNetworkException): the host must
+ * not read "refused by policy" as "mint unreachable" and fall back to offline mode.
+ */
+final class ConnectGuard
+{
+    /** @var (callable(string $url, string $purpose): string[])|null */
+    private static $guard = null;
+
+    /** Install (or clear with null) an address policy for outbound wallet requests.
+     *  The callable gets the full URL and a purpose ('mint' | 'lnurl' | 'http') and
+     *  returns the CURLOPT_RESOLVE entries to pin ("host:port:addr[,addr]"), or [] for
+     *  no pin. It throws to refuse the connection. */
+    public static function set(?callable $guard): void { self::$guard = $guard; }
+
+    /** Whether a guard is installed. */
+    public static function isSet(): bool { return self::$guard !== null; }
+
+    /**
+     * @return array<int,mixed> extra curl options (CURLOPT_RESOLVE), [] when no guard
+     * @throws CashuException "Connection refused: ..." when the guard refuses the URL
+     * @throws CashuNetworkException unchanged, when the guard throws one: a transient
+     *         resolution failure (DNS down, host unknown) is "unreachable", not a
+     *         policy refusal, and the host may treat it as such (offline fallback)
+     */
+    public static function curlOptions(string $url, string $purpose): array
+    {
+        if (self::$guard === null) {
+            return [];
+        }
+        try {
+            $resolve = (self::$guard)($url, $purpose);
+        } catch (CashuNetworkException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new CashuException('Connection refused: ' . $e->getMessage(), 0, $e);
+        }
+        if (!is_array($resolve)) {
+            throw new CashuException('Connection refused: address policy returned no pin list');
+        }
+        $resolve = array_values(array_filter($resolve, fn($entry) => is_string($entry) && $entry !== ''));
+
+        return $resolve === [] ? [] : [CURLOPT_RESOLVE => $resolve];
+    }
+}
+
+/**
  * HTTP client for mint API
  */
 class MintClient
@@ -2363,8 +2754,76 @@ class MintClient
 
     public function __construct(string $mintUrl, int $timeout = 30)
     {
-        $this->mintUrl = rtrim($mintUrl, '/');
+        // The canonical URL is used for HTTP only. WalletStorage keeps deriving the
+        // wallet id from the URL string the application passed, so existing storage
+        // namespaces do not move.
+        $this->mintUrl = self::canonicalizeMintUrl($mintUrl);
         $this->timeout = $timeout;
+    }
+
+    /**
+     * Normalize a mint URL and reject anything that is not a plain HTTP(S) endpoint.
+     *
+     * The mint URL reaches this class from configuration, from tokens and from payment
+     * requests. Without a scheme check, `file:///etc/passwd` is a valid "mint"; without
+     * canonicalization, `https://Mint.Example/` and `https://mint.example` are two
+     * different endpoints for the same mint.
+     *
+     * @throws CashuException If the URL cannot be used as a mint endpoint
+     */
+    public static function canonicalizeMintUrl(string $mintUrl): string
+    {
+        $mintUrl = trim($mintUrl);
+        $parts = parse_url($mintUrl);
+        if ($parts === false || !isset($parts['scheme'], $parts['host']) || $parts['host'] === '') {
+            throw new CashuException("Invalid mint URL: {$mintUrl}");
+        }
+        if (isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])) {
+            throw new CashuException('Mint URL must not contain credentials or a fragment');
+        }
+
+        $scheme = strtolower($parts['scheme']);
+        if ($scheme !== 'https' && $scheme !== 'http') {
+            throw new CashuException("Unsupported mint URL scheme: {$scheme}");
+        }
+
+        $host = strtolower($parts['host']);
+        $url = $scheme . '://' . $host;
+        if (isset($parts['port'])
+            && !($scheme === 'https' && $parts['port'] === 443)
+            && !($scheme === 'http' && $parts['port'] === 80)) {
+            $url .= ':' . $parts['port'];
+        }
+        if (isset($parts['path'])) {
+            // Collapse duplicate slashes so /foo//bar and /foo/bar are one endpoint.
+            $url .= rtrim(preg_replace('#/+#', '/', $parts['path']), '/');
+        }
+
+        return $url;
+    }
+
+    /**
+     * cURL options restricting a handle (and any redirect) to HTTP(S).
+     *
+     * CURLOPT_PROTOCOLS_STR exists only on PHP >= 8.3 built against libcurl >= 7.85;
+     * referencing it unguarded is a fatal \Error, not a CashuException. The older
+     * bitmask options are deprecated there, so they are used only as the fallback.
+     * Merge with `+` (not array_merge, which renumbers the integer keys).
+     *
+     * @return array<int, string|int>
+     */
+    public static function curlProtocolOptions(): array
+    {
+        if (defined('CURLOPT_PROTOCOLS_STR') && defined('CURLOPT_REDIR_PROTOCOLS_STR')) {
+            return [
+                CURLOPT_PROTOCOLS_STR => 'https,http',
+                CURLOPT_REDIR_PROTOCOLS_STR => 'https,http',
+            ];
+        }
+        return [
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS | CURLPROTO_HTTP,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS | CURLPROTO_HTTP,
+        ];
     }
 
     /**
@@ -2377,18 +2836,23 @@ class MintClient
 
     /**
      * Make a POST request
+     *
+     * @param int|null $timeout Per-request total timeout override (seconds)
      */
-    public function post(string $path, array $data): array
+    public function post(string $path, array $data, ?int $timeout = null): array
     {
-        return $this->request('POST', $path, $data);
+        return $this->request('POST', $path, $data, $timeout);
     }
 
     /**
      * Make an HTTP request
      */
-    private function request(string $method, string $path, ?array $data = null): array
+    private function request(string $method, string $path, ?array $data = null, ?int $timeout = null): array
     {
         $url = $this->mintUrl . '/v1/' . ltrim($path, '/');
+        // Before curl_init: a refused address never opens a handle.
+        $guardOptions = ConnectGuard::curlOptions($url, 'mint');
+        $timeout = $timeout ?? $this->timeout;
 
         // Cap the response body so a hostile or misconfigured mint can't pin a
         // PHP-FPM worker's memory with an unbounded (multi-GB) reply. Mint URLs
@@ -2404,13 +2868,16 @@ class MintClient
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeout,
+            // A redirect target would bypass the scheme check and the connect guard.
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_TIMEOUT => $timeout,
             // Bound the TCP/TLS handshake separately from the total timeout so a
             // mint whose connect black-holes can't consume the whole budget on
             // the handshake (and so a hung connect fails fast).
-            CURLOPT_CONNECTTIMEOUT => min($this->timeout, 10),
+            CURLOPT_CONNECTTIMEOUT => min($timeout, 10),
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_USERAGENT => 'cashu-wallet-php',
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
                 'Accept: application/json'
@@ -2424,7 +2891,7 @@ class MintClient
                 $bodyBuf .= $chunk;
                 return $len;
             },
-        ]);
+        ] + $guardOptions + self::curlProtocolOptions());
 
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
@@ -2458,12 +2925,16 @@ class MintClient
         $decoded = json_decode($response, true);
 
         if ($httpCode >= 400) {
-            $errorMsg = $decoded['detail'] ?? "HTTP error $httpCode";
+            $errorMsg = (is_array($decoded) ? ($decoded['detail'] ?? null) : null) ?? "HTTP error $httpCode";
             if (is_array($errorMsg)) {
                 $errorMsg = json_encode($errorMsg);
             }
-            $errorCode = $decoded['code'] ?? null;
-            throw new CashuProtocolException($errorMsg, $errorCode);
+            $errorCode = is_array($decoded) ? ($decoded['code'] ?? null) : null;
+            throw new CashuProtocolException(
+                (string)$errorMsg,
+                is_int($errorCode) ? $errorCode : (is_numeric($errorCode) ? (int)$errorCode : null),
+                (int)$httpCode
+            );
         }
 
         // A 2xx with an empty or non-JSON body is NOT success. A mint that
@@ -2483,7 +2954,12 @@ class MintClient
         // a protocol error rather than treating it as a successful empty result.
         if (array_key_exists('code', $decoded) && array_key_exists('detail', $decoded)) {
             $errorMsg = is_array($decoded['detail']) ? json_encode($decoded['detail']) : (string)$decoded['detail'];
-            throw new CashuProtocolException($errorMsg, $decoded['code']);
+            $code = $decoded['code'];
+            throw new CashuProtocolException(
+                $errorMsg,
+                is_int($code) ? $code : (is_numeric($code) ? (int)$code : null),
+                (int)$httpCode
+            );
         }
 
         return $decoded;
@@ -2504,8 +2980,31 @@ class MintClient
  */
 class WalletStorage
 {
+    /** Seed was generated by this installation and bound before any use: ready at once. */
+    public const INIT_FRESH_SEED = 'fresh_seed';
+    /** Existing (imported, reopened or unknown-history) seed: blocked until recovery completes. */
+    public const INIT_RESTORE_REQUIRED = 'restore_required';
+    /** Pre-fingerprint storage that already held this seed's history, adopted as-is. */
+    public const INIT_ADOPTED_STORAGE = 'adopted_storage';
+
+    /** Why an account is ready (cashu_wallet_metadata.ready_reason). */
+    public const READY_FRESH_SEED = 'fresh_seed';
+    public const READY_ADOPTED_STORAGE = 'adopted_storage';
+    public const READY_RECOVERY_COMPLETE = 'recovery_complete';
+
+    /** Identifies the recovery algorithm that readied an account (recovery_version). */
+    public const RECOVERY_VERSION = 'restore-step/1';
+
     private \PDO $pdo;
     private string $walletId;
+    private string $mintUrl = '';
+    private string $unit = 'sat';
+    /**
+     * Fingerprint of the seed currently operating on this namespace. A namespace
+     * (mint:unit) may be shared by several seeds (one per store on a multi-store
+     * server); provenance, readiness and restore sessions are tracked per seed.
+     */
+    private ?string $seedFingerprint = null;
 
     /**
      * Create a wallet storage instance
@@ -2525,9 +3024,61 @@ class WalletStorage
         $this->pdo = new \PDO("sqlite:$dbPath");
         $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $this->pdo->exec('PRAGMA journal_mode = WAL');
-        $this->pdo->exec('PRAGMA busy_timeout = 5000');
-        $this->walletId = substr(hash('sha256', $mintUrl . ':' . $unit), 0, 16);
+        // Two connections to one SQLite file (the application's own handle and this
+        // one) serialize their writes. 15s absorbs a slow mint round-trip held inside
+        // another connection's transaction; below that, ordinary contention surfaced
+        // to callers as "database is locked" — after the mint had already acted.
+        $this->pdo->exec('PRAGMA busy_timeout = 15000');
+        // The wallet id is derived from the URL string exactly as passed (not the
+        // canonical HTTP form): it is the storage identity of existing deployments.
+        $this->walletId = self::deriveWalletId($mintUrl, $unit);
+        $this->mintUrl = $mintUrl;
+        $this->unit = $unit;
         $this->initSchema();
+    }
+
+    public static function deriveWalletId(string $mintUrl, string $unit = 'sat'): string
+    {
+        return substr(hash('sha256', $mintUrl . ':' . $unit), 0, 16);
+    }
+
+    /**
+     * Storage for another unit of the same mint, sharing this connection.
+     *
+     * Sharing the PDO is what lets a restore write one unit's proofs and counters and
+     * the owning account's scan checkpoint in a single transaction.
+     */
+    public function forUnit(string $unit): self
+    {
+        if (strtolower($unit) === strtolower($this->unit)) {
+            return $this;
+        }
+        $sibling = (new \ReflectionClass(self::class))->newInstanceWithoutConstructor();
+        $sibling->pdo = $this->pdo;
+        $sibling->mintUrl = $this->mintUrl;
+        $sibling->unit = $unit;
+        $sibling->walletId = self::deriveWalletId($this->mintUrl, $unit);
+        $sibling->seedFingerprint = $this->seedFingerprint;
+        return $sibling;
+    }
+
+    public function getUnit(): string
+    {
+        return $this->unit;
+    }
+
+    /** Select the seed whose provenance/readiness this storage reports (set by Wallet). */
+    public function setSeedFingerprint(?string $fingerprint): void
+    {
+        $this->seedFingerprint = $fingerprint;
+    }
+
+    private function requireFingerprint(): string
+    {
+        if ($this->seedFingerprint === null) {
+            throw new CashuException('No seed selected on this storage (initialize the wallet from a mnemonic first)');
+        }
+        return $this->seedFingerprint;
     }
 
     /**
@@ -2590,6 +3141,72 @@ class WalletStorage
             CREATE INDEX IF NOT EXISTS idx_proofs_secret
                 ON cashu_proofs(secret);
         ");
+
+        self::migrateSchema($pdo);
+        self::createProvenanceTables($pdo);
+    }
+
+    /**
+     * Seed provenance and recovery bookkeeping, per (namespace, seed): whether the
+     * seed may issue outputs on this namespace (ready), why, and the state of its
+     * resumable NUT-09 restore session; plus the per-keyset scan cursor.
+     */
+    private static function createProvenanceTables(\PDO $pdo): void
+    {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS cashu_wallet_metadata (
+                wallet_id TEXT NOT NULL,
+                seed_fingerprint TEXT NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                init_reason TEXT,
+                ready_reason TEXT,
+                recovered_at INTEGER,
+                recovery_version TEXT,
+                restore_status TEXT,
+                restore_gap INTEGER,
+                restore_started_at INTEGER,
+                restore_updated_at INTEGER,
+                restore_error TEXT,
+                PRIMARY KEY(wallet_id, seed_fingerprint)
+            );
+
+            -- highest_signed is NULL until the mint has signed any counter of the keyset.
+            CREATE TABLE IF NOT EXISTS cashu_restore_progress (
+                wallet_id TEXT NOT NULL,
+                seed_fingerprint TEXT NOT NULL,
+                keyset_id TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                next_counter INTEGER NOT NULL DEFAULT 0,
+                highest_signed INTEGER,
+                empty_run INTEGER NOT NULL DEFAULT 0,
+                done INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(wallet_id, seed_fingerprint, keyset_id)
+            );
+        ");
+    }
+
+    /**
+     * Idempotent schema upkeep. The provenance tables were briefly created in a
+     * single-seed-per-namespace shape (never released); such tables are rebuilt in
+     * the per-seed shape (they hold no money, only readiness bookkeeping).
+     */
+    private static function migrateSchema(\PDO $pdo): void
+    {
+        foreach (['cashu_wallet_metadata', 'cashu_restore_progress'] as $table) {
+            $columns = [];
+            foreach ($pdo->query("PRAGMA table_info($table)")->fetchAll(\PDO::FETCH_ASSOC) as $column) {
+                $columns[$column['name']] = (int)$column['pk'];
+            }
+            if (empty($columns)) {
+                continue;
+            }
+            if (!isset($columns['seed_fingerprint']) || $columns['seed_fingerprint'] === 0) {
+                $pdo->exec("DROP TABLE $table");
+            }
+        }
     }
 
     /**
@@ -2614,6 +3231,562 @@ class WalletStorage
     public function getPdo(): \PDO
     {
         return $this->pdo;
+    }
+
+    // ========================================================================
+    // TRANSACTIONS (write-lock-first; savepoint-aware)
+    // ========================================================================
+
+    /**
+     * Start a write transaction, or a savepoint when the caller already has one open.
+     *
+     * `exec('BEGIN IMMEDIATE')` bypasses PDO's transaction bookkeeping, so nesting it
+     * inside a caller's beginTransaction() used to throw "cannot start a transaction
+     * within a transaction". Returns the savepoint name to pass back to
+     * commitImmediate()/rollbackImmediate(), or null for a real transaction.
+     */
+    private function beginImmediate(): ?string
+    {
+        if (!$this->pdo->inTransaction()) {
+            $this->pdo->exec('BEGIN IMMEDIATE');
+            return null;
+        }
+        $name = 'cashu_sp_' . bin2hex(random_bytes(6));
+        $this->pdo->exec("SAVEPOINT $name");
+        return $name;
+    }
+
+    private function commitImmediate(?string $savepoint): void
+    {
+        $this->pdo->exec($savepoint === null ? 'COMMIT' : "RELEASE SAVEPOINT $savepoint");
+    }
+
+    private function rollbackImmediate(?string $savepoint): void
+    {
+        try {
+            $this->pdo->exec($savepoint === null ? 'ROLLBACK' : "ROLLBACK TO SAVEPOINT $savepoint");
+            if ($savepoint !== null) {
+                $this->pdo->exec("RELEASE SAVEPOINT $savepoint");
+            }
+        } catch (\Throwable $ignored) {
+            // Already unwound by the caller's own rollback.
+        }
+    }
+
+    /**
+     * Start a write transaction that PDO tracks, holding SQLite's write lock from the start.
+     *
+     * PDO::beginTransaction() is DEFERRED: a transaction that reads first and writes later
+     * fails at once with "database is locked" when another connection committed in
+     * between, because busy_timeout does not apply to upgrading a stale read snapshot.
+     * A no-op write as the first statement takes the write lock up front and does
+     * honour busy_timeout. Unlike exec('BEGIN IMMEDIATE'), nested storeProofs() and
+     * friends see the transaction on every PHP version. Returns a savepoint name when the
+     * caller already has a transaction open, or null.
+     */
+    private function beginWrite(): ?string
+    {
+        if ($this->pdo->inTransaction()) {
+            $name = 'cashu_sp_' . bin2hex(random_bytes(6));
+            $this->pdo->exec("SAVEPOINT $name");
+            return $name;
+        }
+        $this->pdo->beginTransaction();
+        try {
+            $this->pdo->exec('DELETE FROM cashu_restore_progress WHERE 0');
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            throw $e;
+        }
+        return null;
+    }
+
+    private function commitWrite(?string $savepoint): void
+    {
+        if ($savepoint === null) {
+            $this->pdo->commit();
+        } else {
+            $this->pdo->exec("RELEASE SAVEPOINT $savepoint");
+        }
+    }
+
+    private function rollbackWrite(?string $savepoint): void
+    {
+        try {
+            if ($savepoint === null) {
+                if ($this->pdo->inTransaction()) {
+                    $this->pdo->rollBack();
+                }
+            } else {
+                $this->pdo->exec("ROLLBACK TO SAVEPOINT $savepoint");
+                $this->pdo->exec("RELEASE SAVEPOINT $savepoint");
+            }
+        } catch (\Throwable $ignored) {
+            // Already unwound by the caller's own rollback.
+        }
+    }
+
+    // ========================================================================
+    // SEED PROVENANCE
+    // ========================================================================
+
+    /** Return whether this account has any state predating seed metadata. */
+    public function hasWalletData(): bool
+    {
+        foreach (['cashu_proofs', 'cashu_counters', 'cashu_pending_operations'] as $table) {
+            $stmt = $this->pdo->prepare("SELECT 1 FROM $table WHERE wallet_id = ? LIMIT 1");
+            $stmt->execute([$this->walletId]);
+            if ($stmt->fetchColumn() !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Fingerprint of the selected seed when it is bound to this namespace, else null. */
+    public function getSeedFingerprint(): ?string
+    {
+        if ($this->seedFingerprint === null) {
+            return null;
+        }
+        return $this->getMetadataRow() === null ? null : $this->seedFingerprint;
+    }
+
+    /** All seed fingerprints bound to this namespace. @return string[] */
+    public function getBoundSeedFingerprints(): array
+    {
+        $stmt = $this->pdo->prepare('SELECT seed_fingerprint FROM cashu_wallet_metadata WHERE wallet_id = ? ORDER BY created_at');
+        $stmt->execute([$this->walletId]);
+        return array_map('strval', $stmt->fetchAll(\PDO::FETCH_COLUMN));
+    }
+
+    public function isSeedReady(): bool
+    {
+        $row = $this->getMetadataRow();
+        return $row !== null && (int)$row['ready'] === 1;
+    }
+
+    /** The selected seed is bound to this namespace but not ready: issuance must wait for recovery. */
+    public function requiresRecovery(): bool
+    {
+        $row = $this->getMetadataRow();
+        return $row !== null && (int)$row['ready'] !== 1;
+    }
+
+    /**
+     * Bind the selected seed to this namespace. Callers must explicitly choose new or
+     * legacy adoption. Several seeds may be bound to one namespace (multi-store
+     * servers share one namespace per mint:unit); each keeps its own readiness.
+     *
+     * The initialization reason is recorded with the binding and never inferred later:
+     *  - $expectEmpty && $ready: a seed generated here and never used (fresh_seed, ready);
+     *  - !$ready: an existing seed that must be recovered first (restore_required);
+     *  - !$expectEmpty && $ready: adoption of pre-fingerprint storage. A namespace that
+     *    holds wallet data is adopted ready (adopted_storage); an EMPTY namespace proves
+     *    nothing about the seed, so it is bound restore_required instead of being made
+     *    ready at counter 0.
+     * A namespace that holds data but has no bound seed at all (legacy single-seed
+     * storage) refuses a $expectEmpty binding: that data may be this seed's own history.
+     */
+    public function bindSeedFingerprint(string $fingerprint, bool $expectEmpty, bool $ready = true): void
+    {
+        $this->seedFingerprint = $fingerprint;
+        $savepoint = $this->beginImmediate();
+        try {
+            if ($this->getMetadataRow() === null) {
+                $hasData = $this->hasWalletData();
+                $legacyUnbound = $hasData && $this->getBoundSeedFingerprints() === [];
+                if ($expectEmpty && $legacyUnbound) {
+                    throw new CashuException('Cannot initialize a new seed on storage containing wallet data');
+                }
+                if (!$ready) {
+                    $reason = self::INIT_RESTORE_REQUIRED;
+                } elseif ($expectEmpty) {
+                    $reason = self::INIT_FRESH_SEED;
+                } elseif ($hasData) {
+                    $reason = self::INIT_ADOPTED_STORAGE;
+                } else {
+                    $reason = self::INIT_RESTORE_REQUIRED;
+                    $ready = false;
+                }
+                $stmt = $this->pdo->prepare(
+                    'INSERT INTO cashu_wallet_metadata
+                        (wallet_id, seed_fingerprint, ready, created_at, init_reason, ready_reason)
+                     VALUES (?, ?, ?, ?, ?, ?)'
+                );
+                $stmt->execute([
+                    $this->walletId, $fingerprint, $ready ? 1 : 0, time(), $reason,
+                    $ready ? $reason : null,
+                ]);
+            }
+            $this->commitImmediate($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackImmediate($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Mark the selected seed ready for spending on this namespace.
+     *
+     * Only seeds that never needed recovery may be readied this way. A seed bound for
+     * recovery (restore_required) can become ready only through a completed
+     * restoreStep()/restore(): an empty local database says nothing about what the seed
+     * already did at the mint, so readying one without a scan hands out counter 0 again.
+     *
+     * @throws CashuException for an unbound seed or one that requires recovery
+     */
+    public function markSeedReady(): void
+    {
+        $row = $this->getMetadataRow();
+        if ($row === null) {
+            throw new CashuException('Cannot mark uninitialized storage ready');
+        }
+        if ((int)$row['ready'] === 1) {
+            return;
+        }
+        if (!in_array($row['init_reason'], [self::INIT_FRESH_SEED, self::INIT_ADOPTED_STORAGE], true)) {
+            throw new CashuException(
+                'This account requires recovery before it can be used; complete restore() or ' .
+                'restoreStep() instead of marking it ready'
+            );
+        }
+        $update = $this->pdo->prepare(
+            'UPDATE cashu_wallet_metadata SET ready = 1, ready_reason = COALESCE(ready_reason, init_reason)
+             WHERE wallet_id = ? AND seed_fingerprint = ?'
+        );
+        $update->execute([$this->walletId, $this->requireFingerprint()]);
+    }
+
+    /**
+     * Seed provenance and recovery state of this account, for audits and dashboards.
+     *
+     * @return array{
+     *   bound: bool, fingerprint: ?string, init_reason: ?string, legacy: bool,
+     *   ready: bool, ready_reason: ?string, recovered_at: ?int, recovery_version: ?string,
+     *   requires_recovery: bool, recovery: array
+     * }
+     */
+    public function getSeedProvenance(): array
+    {
+        $row = $this->getMetadataRow();
+        $progress = $this->getRestoreProgress();
+        if ($row === null) {
+            return [
+                'bound' => false, 'fingerprint' => null, 'init_reason' => null, 'legacy' => false,
+                'ready' => false, 'ready_reason' => null, 'recovered_at' => null,
+                'recovery_version' => null, 'requires_recovery' => true, 'recovery' => $progress,
+            ];
+        }
+        $ready = (int)$row['ready'] === 1;
+        return [
+            'bound' => true,
+            'fingerprint' => (string)$row['seed_fingerprint'],
+            'init_reason' => $row['init_reason'],
+            'legacy' => $row['init_reason'] === null,
+            'ready' => $ready,
+            'ready_reason' => $row['ready_reason'] ?? ($ready && $row['init_reason'] === null ? 'legacy' : null),
+            'recovered_at' => $row['recovered_at'] === null ? null : (int)$row['recovered_at'],
+            'recovery_version' => $row['recovery_version'],
+            'requires_recovery' => !$ready,
+            'recovery' => $progress,
+        ];
+    }
+
+    private function getMetadataRow(): ?array
+    {
+        if ($this->seedFingerprint === null) {
+            return null;
+        }
+        $stmt = $this->pdo->prepare('SELECT * FROM cashu_wallet_metadata WHERE wallet_id = ? AND seed_fingerprint = ?');
+        $stmt->execute([$this->walletId, $this->seedFingerprint]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row === false ? null : $row;
+    }
+
+    // ------------------------------------------------------------------------
+    // Resumable restore bookkeeping (used by Wallet::restoreStep(); @internal)
+    // ------------------------------------------------------------------------
+
+    /**
+     * The persisted restore session this account owns.
+     *
+     * @return array{status: string, gap: ?int, started_at: ?int, updated_at: ?int,
+     *               error: ?string, unknown_proofs: int, keysets: array<string, array>}
+     *         status is 'none', 'in_progress' or 'complete'
+     */
+    public function getRestoreProgress(): array
+    {
+        $row = $this->getMetadataRow();
+        $keysets = [];
+        $stmt = $this->pdo->prepare(
+            'SELECT keyset_id, unit, next_counter, highest_signed, empty_run, done, last_error, updated_at
+             FROM cashu_restore_progress WHERE wallet_id = ? AND seed_fingerprint = ? ORDER BY rowid'
+        );
+        $stmt->execute([$this->walletId, (string)$this->seedFingerprint]);
+        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $keysets[$r['keyset_id']] = [
+                'unit' => $r['unit'],
+                'next_counter' => (int)$r['next_counter'],
+                'highest_signed' => $r['highest_signed'] === null ? null : (int)$r['highest_signed'],
+                'empty_run' => (int)$r['empty_run'],
+                'done' => (int)$r['done'] === 1,
+                'error' => $r['last_error'],
+                'updated_at' => (int)$r['updated_at'],
+            ];
+        }
+        return [
+            'status' => $row['restore_status'] ?? 'none',
+            'gap' => isset($row['restore_gap']) ? (int)$row['restore_gap'] : null,
+            'started_at' => isset($row['restore_started_at']) ? (int)$row['restore_started_at'] : null,
+            'updated_at' => isset($row['restore_updated_at']) ? (int)$row['restore_updated_at'] : null,
+            'error' => $row['restore_error'] ?? null,
+            'unknown_proofs' => $this->countProofsInState(ProofState::UNKNOWN),
+            'keysets' => $keysets,
+        ];
+    }
+
+    /** Count this account's proofs in one state. */
+    public function countProofsInState(string $state): int
+    {
+        $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM cashu_proofs WHERE wallet_id = ? AND state = ?');
+        $stmt->execute([$this->walletId, $state]);
+        return (int)$stmt->fetchColumn();
+    }
+
+    /**
+     * Start a new restore session: forget any previous cursor. Counters, proofs and
+     * readiness are untouched — a rescan can only raise counters and add proofs.
+     *
+     * @internal
+     */
+    public function beginRestoreSession(int $gap): void
+    {
+        $fp = $this->requireFingerprint();
+        $savepoint = $this->beginWrite();
+        try {
+            $this->pdo->prepare('DELETE FROM cashu_restore_progress WHERE wallet_id = ? AND seed_fingerprint = ?')
+                ->execute([$this->walletId, $fp]);
+            $stmt = $this->pdo->prepare(
+                "UPDATE cashu_wallet_metadata SET restore_status = 'in_progress', restore_gap = ?,
+                    restore_started_at = ?, restore_updated_at = ?, restore_error = NULL
+                 WHERE wallet_id = ? AND seed_fingerprint = ?"
+            );
+            $now = time();
+            $stmt->execute([$gap, $now, $now, $this->walletId, $fp]);
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /** @internal Widen the gap of a session resumed with a larger tolerance. */
+    public function setRestoreGap(int $gap): void
+    {
+        $this->pdo->prepare('UPDATE cashu_wallet_metadata SET restore_gap = MAX(COALESCE(restore_gap, 0), ?) WHERE wallet_id = ? AND seed_fingerprint = ?')
+            ->execute([$gap, $this->walletId, $this->requireFingerprint()]);
+    }
+
+    /** @internal Create the cursor row for a keyset first seen in this session. */
+    public function ensureRestoreKeyset(string $keysetId, string $unit): void
+    {
+        $this->pdo->prepare(
+            'INSERT INTO cashu_restore_progress (wallet_id, seed_fingerprint, keyset_id, unit, updated_at)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(wallet_id, seed_fingerprint, keyset_id) DO NOTHING'
+        )->execute([$this->walletId, $this->requireFingerprint(), $keysetId, $unit, time()]);
+    }
+
+    /** @internal Record the last error of the session (and optionally of one keyset). */
+    public function recordRestoreError(?string $keysetId, ?string $error): void
+    {
+        $fp = $this->requireFingerprint();
+        $now = time();
+        if ($keysetId !== null) {
+            $this->pdo->prepare(
+                'UPDATE cashu_restore_progress SET last_error = ?, updated_at = ?
+                 WHERE wallet_id = ? AND seed_fingerprint = ? AND keyset_id = ?'
+            )->execute([$error, $now, $this->walletId, $fp, $keysetId]);
+        }
+        $this->pdo->prepare(
+            'UPDATE cashu_wallet_metadata SET restore_error = ?, restore_updated_at = ?
+             WHERE wallet_id = ? AND seed_fingerprint = ?'
+        )->execute([$error, $now, $this->walletId, $fp]);
+    }
+
+    /**
+     * Persist one validated restore batch atomically: the recovered proofs (in the unit
+     * storage they belong to), the monotonic counter raise and this account's scan
+     * checkpoint either all commit or none does, so a crash anywhere resumes from the
+     * previous checkpoint and re-finds the same proofs (inserts are idempotent).
+     *
+     * State rules: only proofs the mint verified UNSPENT become spendable; SPENT is
+     * applied to any local row except EXPORTED ones and inputs owned by an unfinished
+     * swap/melt journal; proofs without an authoritative state are parked UNKNOWN,
+     * but only if the row is new; an UNKNOWN row the mint now reports UNSPENT is
+     * promoted.
+     *
+     * The checkpoint advances only from $expectedNext, so two concurrent scans cannot
+     * move the cursor backwards; proofs and counters are written regardless.
+     *
+     * @internal
+     * @param Proof[] $unspent
+     * @param Proof[] $spent
+     * @param Proof[] $unknown
+     * @return bool Whether this batch advanced the checkpoint
+     */
+    public function applyRestoreBatch(
+        self $unitStorage,
+        string $keysetId,
+        int $expectedNext,
+        int $nextCounter,
+        ?int $highestSigned,
+        int $emptyRun,
+        bool $done,
+        array $unspent,
+        array $spent,
+        array $unknown,
+        ?string $fingerprint
+    ): bool {
+        if ($unitStorage->pdo !== $this->pdo) {
+            throw new CashuException('Restore batch storage must share the owning connection');
+        }
+        $fp = $this->requireFingerprint();
+        $savepoint = $this->beginWrite();
+        try {
+            $hasFindings = !empty($unspent) || !empty($spent) || !empty($unknown) || $highestSigned !== null;
+            if ($unitStorage !== $this && $fingerprint !== null && $hasFindings
+                && $unitStorage->getSeedFingerprint() === null) {
+                // The seed's history in this unit is being recovered now; it stays
+                // not-ready there until the whole scan completes.
+                $unitStorage->bindSeedFingerprint($fingerprint, true, false);
+            }
+            $reserved = array_flip($unitStorage->getReservedInputSecrets());
+
+            if (!empty($unspent)) {
+                $unitStorage->storeProofs($unspent);
+                $unitStorage->transitionProofStates(
+                    array_map(fn($p) => $p->secret, $unspent),
+                    ProofState::UNSPENT,
+                    [ProofState::UNKNOWN],
+                    $reserved
+                );
+            }
+            if (!empty($spent)) {
+                $unitStorage->storeProofs($spent);
+                $unitStorage->transitionProofStates(
+                    array_map(fn($p) => $p->secret, $spent),
+                    ProofState::SPENT,
+                    [ProofState::UNSPENT, ProofState::UNKNOWN, ProofState::PENDING],
+                    $reserved
+                );
+            }
+            if (!empty($unknown)) {
+                $secrets = array_map(fn($p) => $p->secret, $unknown);
+                $known = $unitStorage->getProofsStatesBySecrets($secrets);
+                $unitStorage->storeProofs($unknown);
+                $fresh = array_values(array_filter($secrets, fn($secret) => !isset($known[$secret])));
+                if (!empty($fresh)) {
+                    $unitStorage->updateProofsState($fresh, ProofState::UNKNOWN);
+                }
+            }
+            if ($highestSigned !== null) {
+                $unitStorage->raiseCounter($keysetId, $highestSigned + 1);
+            }
+
+            $now = time();
+            $stmt = $this->pdo->prepare(
+                'UPDATE cashu_restore_progress
+                 SET next_counter = ?, highest_signed = ?, empty_run = ?, done = ?, last_error = NULL, updated_at = ?
+                 WHERE wallet_id = ? AND seed_fingerprint = ? AND keyset_id = ? AND next_counter = ?'
+            );
+            $stmt->execute([
+                $nextCounter, $highestSigned, $emptyRun, $done ? 1 : 0, $now,
+                $this->walletId, $fp, $keysetId, $expectedNext,
+            ]);
+            $advanced = $stmt->rowCount() === 1;
+            $this->pdo->prepare(
+                'UPDATE cashu_wallet_metadata SET restore_updated_at = ? WHERE wallet_id = ? AND seed_fingerprint = ?'
+            )->execute([$now, $this->walletId, $fp]);
+
+            $this->commitWrite($savepoint);
+            return $advanced;
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Complete the restore session: every keyset's scan and every proof-state check is
+     * done. The only way an account bound restore_required becomes ready. Siblings (other
+     * units of this mint bound to the same seed) are readied too: the scan covered their
+     * keysets and raised their counters.
+     *
+     * @internal Called by Wallet with the mint's full list of derivable keysets.
+     * @param string[] $keysetIds Every keyset that had to be scanned
+     * @param string[] $siblingUnits
+     * @throws CashuException when the persisted session is not complete
+     */
+    public function finalizeRecovery(array $keysetIds, array $siblingUnits, bool $markReady = true): void
+    {
+        $fp = $this->requireFingerprint();
+        $savepoint = $this->beginWrite();
+        try {
+            $row = $this->getMetadataRow();
+            if ($row === null || ($row['restore_status'] ?? null) !== 'in_progress') {
+                throw new CashuException('No restore session in progress');
+            }
+            $gap = (int)($row['restore_gap'] ?? 0);
+            $check = $this->pdo->prepare(
+                'SELECT empty_run, last_error FROM cashu_restore_progress
+                 WHERE wallet_id = ? AND seed_fingerprint = ? AND keyset_id = ?'
+            );
+            foreach ($keysetIds as $keysetId) {
+                $check->execute([$this->walletId, $fp, $keysetId]);
+                $progress = $check->fetch(\PDO::FETCH_ASSOC);
+                if ($gap < 1 || $progress === false || (int)$progress['empty_run'] < $gap
+                    || $progress['last_error'] !== null) {
+                    throw new CashuException('Restore scan is not complete');
+                }
+            }
+            $storages = [$this];
+            foreach ($siblingUnits as $unit) {
+                $sibling = $this->forUnit($unit);
+                if ($sibling !== $this) {
+                    $storages[] = $sibling;
+                }
+            }
+            foreach ($storages as $storage) {
+                if ($storage->countProofsInState(ProofState::UNKNOWN) > 0) {
+                    throw new CashuException('Restored proofs still await state verification');
+                }
+            }
+            $now = time();
+            $this->pdo->prepare(
+                "UPDATE cashu_wallet_metadata SET restore_status = 'complete', restore_error = NULL,
+                    restore_updated_at = ?, recovered_at = ?, recovery_version = ?
+                 WHERE wallet_id = ? AND seed_fingerprint = ?"
+            )->execute([$now, $now, self::RECOVERY_VERSION, $this->walletId, $fp]);
+            if ($markReady) {
+                $fingerprint = $fp;
+                foreach ($storages as $storage) {
+                    $stmt = $this->pdo->prepare(
+                        'UPDATE cashu_wallet_metadata
+                         SET ready = 1, ready_reason = ?, recovered_at = ?, recovery_version = ?
+                         WHERE wallet_id = ? AND seed_fingerprint = ?'
+                    );
+                    $stmt->execute([
+                        self::READY_RECOVERY_COMPLETE, $now, self::RECOVERY_VERSION,
+                        $storage->walletId, $fingerprint,
+                    ]);
+                }
+            }
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
     }
 
     /**
@@ -2687,36 +3860,119 @@ class WalletStorage
      * @param Proof[] $proofs Array of Proof objects
      * @param string|null $quoteId Optional mint quote ID for tracking
      */
-    public function storeProofs(array $proofs, ?string $quoteId = null): void
+    public function storeProofs(array $proofs, ?string $quoteId = null): int
     {
+        if (empty($proofs)) {
+            return 0;
+        }
+
+        // Never resurrect or overwrite an existing row: a re-store of a known secret
+        // (recovery racing a completed swap, an offline token received twice, a NUT-19
+        // replay) used to flip SPENT back to UNSPENT via INSERT OR REPLACE. An
+        // existing row with different keyset/amount/C is a conflict, not a no-op.
         $stmt = $this->pdo->prepare("
-            INSERT OR REPLACE INTO cashu_proofs
+            INSERT INTO cashu_proofs
             (wallet_id, keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at)
             VALUES (?, ?, ?, ?, ?, ?, 'UNSPENT', ?, ?)
+            ON CONFLICT(wallet_id, secret) DO NOTHING
         ");
+        $existing = $this->pdo->prepare(
+            'SELECT keyset_id, amount, C FROM cashu_proofs WHERE wallet_id = ? AND secret = ?'
+        );
 
-        $now = time();
-        foreach ($proofs as $proof) {
-            $dleq = null;
-            if ($proof->dleq !== null) {
-                $dleq = json_encode([
-                    'e' => $proof->dleq->e,
-                    's' => $proof->dleq->s,
-                    'r' => $proof->dleq->r
+        // Store all proofs atomically: either every proof of a mint/swap/melt-change is
+        // persisted, or none is. A crash mid-loop must not leave a partial set (which
+        // would silently lose the un-stored denominations).
+        $savepoint = $this->beginWrite();
+        $stored = 0;
+        try {
+            $now = time();
+            foreach ($proofs as $proof) {
+                $dleq = null;
+                if ($proof->dleq !== null) {
+                    $dleq = json_encode([
+                        'e' => $proof->dleq->e,
+                        's' => $proof->dleq->s,
+                        'r' => $proof->dleq->r
+                    ]);
+                }
+
+                $stmt->execute([
+                    $this->walletId,
+                    $proof->id,
+                    $proof->amount,
+                    $proof->secret,
+                    $proof->C,
+                    $dleq,
+                    $quoteId,
+                    $now
                 ]);
+                $stored += $stmt->rowCount();
+                $existing->execute([$this->walletId, $proof->secret]);
+                $row = $existing->fetch(\PDO::FETCH_ASSOC);
+                if ($row === false || $row['keyset_id'] !== $proof->id
+                    || (int)$row['amount'] !== $proof->amount
+                    || strtolower($row['C']) !== strtolower($proof->C)) {
+                    throw new CashuException('Conflicting proof data for an existing secret');
+                }
             }
-
-            $stmt->execute([
-                $this->walletId,
-                $proof->id,
-                $proof->amount,
-                $proof->secret,
-                $proof->C,
-                $dleq,
-                $quoteId,
-                $now
-            ]);
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
         }
+        return $stored;
+    }
+
+    /**
+     * Compare-and-set state change: move proofs to $to, but only rows currently in one
+     * of $from, and never rows in $exclude (secret => true; e.g. array_flip() of
+     * getReservedInputSecrets() for journal-owned inputs).
+     *
+     * This is the call for application-level state changes (export, marking spent
+     * after a NUT-07 check). Compare the return value with count($secrets): a
+     * shortfall means another writer — usually a swap/melt journal that reserved a
+     * proof as PENDING — got there first, and that proof must not be handed out.
+     *
+     * @param string[] $secrets
+     * @param string[] $from States a row may be in to be changed
+     * @param array<string, true> $exclude
+     * @return int Rows changed
+     */
+    public function transitionProofStates(array $secrets, string $to, array $from, array $exclude = []): int
+    {
+        if (!ProofState::isValid($to)) {
+            throw new CashuException("Unknown proof state: $to");
+        }
+        $secrets = array_values(array_filter($secrets, fn($secret) => !isset($exclude[$secret])));
+        if (empty($secrets) || empty($from)) {
+            return 0;
+        }
+        $changed = 0;
+        // One transaction across chunks, so a caller comparing the count never sees a
+        // half-applied set.
+        $savepoint = $this->beginWrite();
+        try {
+            foreach (array_chunk($secrets, 400) as $chunk) {
+                $in = implode(',', array_fill(0, count($chunk), '?'));
+                $fromIn = implode(',', array_fill(0, count($from), '?'));
+                $stmt = $this->pdo->prepare(
+                    "UPDATE cashu_proofs SET state = ?, spent_at = ?
+                     WHERE wallet_id = ? AND secret IN ($in) AND state IN ($fromIn)"
+                );
+                $stmt->execute(array_merge(
+                    [$to, $to === ProofState::SPENT ? time() : null, $this->walletId],
+                    $chunk,
+                    array_values($from)
+                ));
+                $changed += $stmt->rowCount();
+            }
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+        return $changed;
     }
 
     /**
@@ -2875,6 +4131,49 @@ class WalletStorage
         }, $rows);
     }
 
+    /**
+     * Proof objects for the given secrets (any state), in the order requested;
+     * unknown secrets are skipped.
+     *
+     * @param string[] $secrets
+     * @return Proof[]
+     */
+    public function getProofsBySecretsAsObjects(array $secrets): array
+    {
+        if (empty($secrets)) {
+            return [];
+        }
+        $rows = [];
+        foreach (array_chunk(array_values($secrets), 400) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+            $stmt = $this->pdo->prepare("
+                SELECT keyset_id, amount, secret, C, dleq
+                FROM cashu_proofs
+                WHERE wallet_id = ? AND secret IN ($placeholders)
+            ");
+            $stmt->execute(array_merge([$this->walletId], $chunk));
+            foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+                $rows[$row['secret']] = $row;
+            }
+        }
+        $proofs = [];
+        foreach ($secrets as $secret) {
+            if (!isset($rows[$secret])) {
+                continue;
+            }
+            $row = $rows[$secret];
+            $dleq = null;
+            if (!empty($row['dleq'])) {
+                $dleqData = json_decode($row['dleq'], true);
+                if (is_array($dleqData) && isset($dleqData['e'], $dleqData['s'])) {
+                    $dleq = new DLEQWallet((string)$dleqData['e'], (string)$dleqData['s'], (string)($dleqData['r'] ?? ''));
+                }
+            }
+            $proofs[] = new Proof($row['keyset_id'], (int)$row['amount'], $row['secret'], $row['C'], $dleq);
+        }
+        return $proofs;
+    }
+
     // ========================================================================
     // COUNTER MANAGEMENT
     // ========================================================================
@@ -2982,24 +4281,41 @@ class WalletStorage
      */
     public function incrementCounter(string $keysetId): int
     {
-        // Use BEGIN IMMEDIATE to acquire lock immediately and prevent race conditions
-        // when multiple processes try to increment the counter concurrently.
-        // We use raw SQL commands throughout since exec('BEGIN IMMEDIATE') doesn't
-        // update PDO's internal transaction state.
-        $this->pdo->exec('BEGIN IMMEDIATE');
+        // Acquire the write lock immediately so two processes cannot hand out the same
+        // counter (and therefore the same secret). Raw SQL is used because
+        // exec('BEGIN IMMEDIATE') does not update PDO's internal transaction state;
+        // beginImmediate() falls back to a savepoint when a caller already holds one.
+        $savepoint = $this->beginImmediate();
         try {
             $current = $this->getCounter($keysetId);
             $this->setCounter($keysetId, $current + 1);
-            $this->pdo->exec('COMMIT');
+            $this->commitImmediate($savepoint);
             return $current;
-        } catch (\Exception $e) {
-            try {
-                $this->pdo->exec('ROLLBACK');
-            } catch (\Exception $rollbackEx) {
-                // Transaction may have already been rolled back or not started
-            }
+        } catch (\Throwable $e) {
+            $this->rollbackImmediate($savepoint);
             throw $e;
         }
+    }
+
+    /**
+     * Raise a counter to at least $counter, never lowering it.
+     *
+     * A read-then-write "max" loses to a concurrent allocation: restore reads 100, a
+     * worker allocates 100 and stores 101, restore writes its stale 100, and the next
+     * allocation reuses secret 100. One statement makes that impossible.
+     *
+     * @return int The counter value after the update
+     */
+    public function raiseCounter(string $keysetId, int $counter): int
+    {
+        $stmt = $this->pdo->prepare("
+            INSERT INTO cashu_counters (wallet_id, keyset_id, counter)
+            VALUES (?, ?, ?)
+            ON CONFLICT(wallet_id, keyset_id)
+            DO UPDATE SET counter = MAX(counter, excluded.counter)
+        ");
+        $stmt->execute([$this->walletId, $keysetId, $counter]);
+        return $this->getCounter($keysetId);
     }
 
     /**
@@ -3021,6 +4337,335 @@ class WalletStorage
         }
 
         return $counters;
+    }
+
+    // ========================================================================
+    // PENDING SPENDS (journal + input reservation in one write lock)
+    // ========================================================================
+
+    /**
+     * Atomically reserve spend inputs, allocate deterministic outputs, and journal
+     * the operation before any mint request. Inputs not already in this storage
+     * (for example received tokens) are durably imported in PENDING state.
+     *
+     * Returns the journal data (counter_start, keyset_id, amounts, input_secrets, plus
+     * imported_secrets / reserved_from when applicable). Calling it again with the same
+     * id and inputs returns the existing journal unchanged (idempotent retry).
+     *
+     * @param Proof[] $proofs
+     * @param int[] $amounts
+     * @param string[] $reservableStates Local states an existing input may be reserved
+     *        from. Default UNSPENT. An input reserved from a non-UNSPENT state goes back
+     *        to that state (not UNSPENT) when the journal releases it. PENDING and SPENT
+     *        are never reservable.
+     */
+    public function preparePendingSpend(
+        string $id,
+        string $type,
+        array $proofs,
+        string $keysetId,
+        array $amounts,
+        array $extraData = [],
+        array $reservableStates = [ProofState::UNSPENT]
+    ): array {
+        $inputSecrets = array_map(fn($proof) => $proof->secret, $proofs);
+        if (count($inputSecrets) !== count(array_unique($inputSecrets))) {
+            throw new CashuException('Cannot reserve duplicate input proofs');
+        }
+        foreach ($reservableStates as $reservable) {
+            if (!ProofState::isValid($reservable)
+                || in_array($reservable, [ProofState::PENDING, ProofState::SPENT], true)) {
+                throw new CashuException("Proofs cannot be reserved from state $reservable");
+            }
+        }
+
+        $savepoint = $this->beginImmediate();
+        try {
+            $existing = $this->getPendingOperationById($id);
+            if ($existing !== null) {
+                $data = $existing['data'];
+                if ($existing['type'] !== $type || ($data['input_secrets'] ?? []) !== $inputSecrets) {
+                    throw new CashuException("Pending operation ID collision: $id");
+                }
+                $this->commitImmediate($savepoint);
+                return $data;
+            }
+            if ($type === 'mint' && str_starts_with($id, 'mint:')
+                && $this->getProofsByQuoteId(substr($id, 5))) {
+                throw new CashuException('Mint quote already completed locally');
+            }
+
+            $select = $this->pdo->prepare(
+                'SELECT state, keyset_id, amount, C FROM cashu_proofs WHERE wallet_id = ? AND secret = ?'
+            );
+            $update = $this->pdo->prepare(
+                'UPDATE cashu_proofs SET state = ?, spent_at = NULL WHERE wallet_id = ? AND secret = ?'
+            );
+            $insert = $this->pdo->prepare("
+                INSERT INTO cashu_proofs
+                (wallet_id, keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'PENDING', NULL, ?)
+            ");
+
+            $imported = [];
+            $reservedFrom = [];
+            foreach ($proofs as $proof) {
+                $select->execute([$this->walletId, $proof->secret]);
+                $row = $select->fetch(\PDO::FETCH_ASSOC);
+                $state = $row === false ? false : $row['state'];
+                if ($row !== false && ($row['keyset_id'] !== $proof->id
+                    || (int)$row['amount'] !== $proof->amount
+                    || strtolower($row['C']) !== strtolower($proof->C))) {
+                    throw new CashuException('Conflicting proof data for an existing secret');
+                }
+                if ($state !== false && !in_array($state, $reservableStates, true)) {
+                    // Message kept verbatim from the pre-journal implementation: the
+                    // host application classifies this text ("Cannot spend proof").
+                    throw new CashuException("Cannot spend proof: state is $state");
+                }
+                if ($state !== false && $state !== ProofState::UNSPENT) {
+                    $reservedFrom[$proof->secret] = $state;
+                }
+                if ($state === false) {
+                    $dleq = $proof->dleq === null ? null : json_encode([
+                        'e' => $proof->dleq->e,
+                        's' => $proof->dleq->s,
+                        'r' => $proof->dleq->r,
+                    ]);
+                    $insert->execute([
+                        $this->walletId, $proof->id, $proof->amount, $proof->secret,
+                        $proof->C, $dleq, time(),
+                    ]);
+                    $imported[] = $proof->secret;
+                } else {
+                    $update->execute([ProofState::PENDING, $this->walletId, $proof->secret]);
+                }
+            }
+
+            $counterStart = $this->getCounter($keysetId);
+            if (!empty($amounts)) {
+                $this->setCounter($keysetId, $counterStart + count($amounts));
+            }
+            $data = array_merge($extraData, [
+                'counter_start' => $counterStart,
+                'keyset_id' => $keysetId,
+                'amounts' => array_values($amounts),
+                'input_secrets' => $inputSecrets,
+            ]);
+            if (!empty($imported)) {
+                // Inputs this operation brought in (a received token). If the mint
+                // definitively refuses them, they are removed again rather than left
+                // as junk rows.
+                $data['imported_secrets'] = $imported;
+            }
+            if (!empty($reservedFrom)) {
+                $data['reserved_from'] = $reservedFrom;
+            }
+            unset($data['expires_at']);
+            $this->savePendingOperation($id, $type, $data, $extraData['expires_at'] ?? null);
+            $this->commitImmediate($savepoint);
+            return $data;
+        } catch (\Throwable $e) {
+            $this->rollbackImmediate($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Atomically persist outputs, transition inputs, and remove the journal.
+     *
+     * $inputState SPENT books the outputs and marks the inputs spent; UNSPENT releases
+     * the inputs (back to the state they were reserved from) and must carry no outputs.
+     */
+    public function finalizePendingSpend(
+        string $id,
+        array $inputSecrets,
+        string $inputState,
+        array $outputProofs = []
+    ): void {
+        $savepoint = $this->beginWrite();
+        try {
+            $operation = $this->getPendingOperationById($id);
+            if ($operation === null) {
+                // A completed/deleted journal no longer owns any inputs or outputs.
+                $this->commitWrite($savepoint);
+                return;
+            }
+            if (!in_array($operation['type'], ['swap', 'melt'], true)
+                || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
+                || count(array_unique($inputSecrets)) !== count($inputSecrets)
+                || !in_array($inputState, [ProofState::SPENT, ProofState::UNSPENT], true)
+                || ($inputState === ProofState::UNSPENT && !empty($outputProofs))) {
+                throw new CashuException('Finalization does not match the pending spend');
+            }
+            $this->assertOwnsReservedInputs($id, $inputSecrets);
+            if (!empty($outputProofs)) {
+                $this->storeProofs($outputProofs);
+            }
+            if ($inputState === ProofState::UNSPENT) {
+                foreach ($this->groupReleasedInputs($operation['data'], $inputSecrets) as $state => $secrets) {
+                    $this->updateProofsState($secrets, $state);
+                }
+            } else {
+                $this->updateProofsState($inputSecrets, $inputState);
+            }
+            $this->deletePendingOperation($id);
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Terminally settle a swap/melt journal whose inputs end in different ways, in one
+     * transaction: each input secret maps to SPENT, UNSPENT (released) or null (row
+     * deleted — only for inputs the operation itself imported). Outputs, if any, are
+     * stored. The same ownership checks as finalizePendingSpend() apply.
+     *
+     * @param array<string, ?string> $outcome secret => ProofState::SPENT|ProofState::UNSPENT|null
+     * @param Proof[] $outputProofs
+     */
+    public function settlePendingSpend(
+        string $id,
+        array $inputSecrets,
+        array $outcome,
+        array $outputProofs = []
+    ): void {
+        $savepoint = $this->beginWrite();
+        try {
+            $operation = $this->getPendingOperationById($id);
+            if ($operation === null) {
+                $this->commitWrite($savepoint);
+                return;
+            }
+            $imported = array_flip($operation['data']['imported_secrets'] ?? []);
+            if (!in_array($operation['type'], ['swap', 'melt'], true)
+                || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
+                || count($outcome) !== count($inputSecrets)) {
+                throw new CashuException('Settlement does not match the pending spend');
+            }
+            foreach ($inputSecrets as $secret) {
+                if (!array_key_exists($secret, $outcome)
+                    || !in_array($outcome[$secret], [ProofState::SPENT, ProofState::UNSPENT, null], true)
+                    || ($outcome[$secret] === null && !isset($imported[$secret]))) {
+                    throw new CashuException('Settlement does not match the pending spend');
+                }
+            }
+            $this->assertOwnsReservedInputs($id, $inputSecrets);
+            if (!empty($outputProofs)) {
+                $this->storeProofs($outputProofs);
+            }
+            $groups = [ProofState::SPENT => []];
+            $released = [];
+            $delete = [];
+            foreach ($outcome as $secret => $state) {
+                if ($state === null) {
+                    $delete[] = (string)$secret;
+                } elseif ($state === ProofState::UNSPENT) {
+                    $released[] = (string)$secret;
+                } else {
+                    $groups[$state][] = (string)$secret;
+                }
+            }
+            foreach ($this->groupReleasedInputs($operation['data'], $released) as $state => $secrets) {
+                $groups[$state] = array_merge($groups[$state] ?? [], $secrets);
+            }
+            foreach ($groups as $state => $secrets) {
+                $this->updateProofsState($secrets, $state);
+            }
+            $this->deleteProofs($delete);
+            $this->deletePendingOperation($id);
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Every input must still be PENDING and owned by this journal alone. Anything else
+     * means a writer outside the journal (an unconditional updateProofsState(), e.g. an
+     * app marking proofs EXPORTED) took them, and finalizing would book outputs for, or
+     * release, proofs this journal no longer controls.
+     */
+    private function assertOwnsReservedInputs(string $id, array $inputSecrets): void
+    {
+        $states = $this->getProofsStatesBySecrets($inputSecrets);
+        $moved = [];
+        foreach ($inputSecrets as $secret) {
+            $state = $states[$secret] ?? 'missing';
+            if ($state !== ProofState::PENDING) {
+                $moved[$state] = ($moved[$state] ?? 0) + 1;
+            }
+        }
+        if (!empty($moved)) {
+            $detail = implode(', ', array_map(fn($state, $n) => "$n $state", array_keys($moved), $moved));
+            throw new CashuException(
+                "Pending spend no longer owns a reserved input: $id has inputs changed outside the journal "
+                . "($detail instead of PENDING); it cannot be finalized until they are PENDING again"
+            );
+        }
+        foreach ($this->getPendingOperations() as $other) {
+            if ($other['id'] !== $id
+                && array_intersect($inputSecrets, $other['data']['input_secrets'] ?? [])) {
+                throw new CashuException('Input is claimed by another pending operation');
+            }
+        }
+    }
+
+    /**
+     * Released inputs go back to the state they were reserved from (UNSPENT unless
+     * preparePendingSpend() was given other reservable states).
+     *
+     * @return array<string, string[]> state => secrets
+     */
+    private function groupReleasedInputs(array $data, array $secrets): array
+    {
+        $from = $data['reserved_from'] ?? [];
+        $groups = [];
+        foreach ($secrets as $secret) {
+            $state = $from[$secret] ?? ProofState::UNSPENT;
+            if (!ProofState::isValid($state) || in_array($state, [ProofState::PENDING, ProofState::SPENT], true)) {
+                $state = ProofState::UNSPENT;
+            }
+            $groups[$state][] = (string)$secret;
+        }
+        return $groups;
+    }
+
+    /** Complete only the exact mint plan that produced these outputs. */
+    public function finalizePendingMint(string $quoteId, array $plan, array $proofs): void
+    {
+        $savepoint = $this->beginWrite();
+        try {
+            $pending = $this->getPendingOperationById('mint:' . $quoteId);
+            if ($pending !== null) {
+                if ($pending['type'] !== 'mint' || $pending['data'] !== $plan) {
+                    throw new CashuException('Mint completion does not match the pending plan');
+                }
+                $this->storeProofs($proofs, $quoteId);
+                $this->deletePendingOperation('mint:' . $quoteId);
+            }
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /** Return secrets reserved by unresolved money-moving operations (melt/swap journals). */
+    public function getReservedInputSecrets(): array
+    {
+        $reserved = [];
+        foreach (['melt', 'swap'] as $type) {
+            foreach ($this->getPendingOperations($type) as $operation) {
+                foreach (($operation['data']['input_secrets'] ?? []) as $secret) {
+                    $reserved[$secret] = true;
+                }
+            }
+        }
+        return array_keys($reserved);
     }
 
     // ========================================================================
@@ -3131,9 +4776,13 @@ class WalletStorage
      */
     public function cleanExpiredPendingOperations(): int
     {
+        // Money-moving journals (mint/melt/swap) are only ever retired by the
+        // recovery routines once the mint's answer allows it; "expired" says
+        // nothing about whether the mint acted on them.
         $stmt = $this->pdo->prepare("
             DELETE FROM cashu_pending_operations
-            WHERE wallet_id = ? AND expires_at IS NOT NULL AND expires_at < ?
+            WHERE wallet_id = ? AND type NOT IN ('mint', 'melt', 'swap')
+              AND expires_at IS NOT NULL AND expires_at < ?
         ");
         $stmt->execute([$this->walletId, time()]);
         return $stmt->rowCount();
@@ -3219,6 +4868,16 @@ class Wallet
     // SQLite storage
     private ?WalletStorage $storage = null;
     private ?string $dbPath = null;
+
+    // Restore session kept in memory when the wallet has no storage
+    private ?array $memoryRestore = null;
+
+    /** Consecutive unsigned counters that end a keyset's restore scan. */
+    public const RESTORE_GAP = 500;
+    /** Counters per NUT-09 request on a GMP host. */
+    public const RESTORE_BATCH = 100;
+    /** Counters per NUT-09 request on a BCMath-only host (derivation is slow there). */
+    public const RESTORE_BATCH_BCMATH = 25;
 
     /**
      * Create a new wallet instance
@@ -3412,35 +5071,38 @@ class Wallet
             return ['error' => 'No storage configured', 'checked' => 0, 'updated' => 0, 'errors' => 0];
         }
 
+        $unknown = $this->reconcileUnknownProofs();
+        $result = $this->syncUnspentProofStates();
+        $result['unknown'] = $unknown;
+        if (!empty($unknown['errors'])) {
+            $result['errors']++;
+        }
+        return $result;
+    }
+
+    private function syncUnspentProofStates(): array
+    {
         $proofs = $this->storage->getProofs(ProofState::UNSPENT);
         if (empty($proofs)) {
             return ['checked' => 0, 'updated' => 0, 'errors' => 0];
         }
 
-        // Build Y values for batch check (NUT-07 /checkstate)
-        $Ys = [];
-        foreach ($proofs as $proof) {
-            $Y = Crypto::hashToCurve($proof['secret']);
-            $Ys[] = bin2hex(Secp256k1::compressPoint($Y));
-        }
-
         try {
-            // Check with mint
-            $response = $this->client->post('checkstate', ['Ys' => $Ys]);
+            // NUT-07, chunked to the mint's limit and matched by Y: a reordering mint is
+            // an error, not a proof marked spent because of someone else's state.
+            $states = $this->inputStatesBySecret(array_map(fn($proof) => $proof['secret'], $proofs));
 
             $updated = 0;
             $toUpdate = [];
-            foreach ($response['states'] ?? [] as $i => $state) {
-                // Normalize case - mints may return lowercase states
-                $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
-                if ($mintState === ProofState::SPENT && isset($proofs[$i])) {
-                    $toUpdate[] = $proofs[$i]['secret'];
+            foreach ($states as $secret => $mintState) {
+                if ($mintState === ProofState::SPENT) {
+                    $toUpdate[] = (string)$secret;
                 }
             }
 
             if (!empty($toUpdate)) {
-                $this->storage->updateProofsState($toUpdate, ProofState::SPENT);
-                $updated = count($toUpdate);
+                // Only rows still UNSPENT: one a journal reserved meanwhile is its to settle.
+                $updated = $this->storage->transitionProofStates($toUpdate, ProofState::SPENT, [ProofState::UNSPENT]);
             }
 
             return [
@@ -3448,7 +5110,7 @@ class Wallet
                 'updated' => $updated,
                 'errors' => 0
             ];
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return [
                 'checked' => count($proofs),
                 'updated' => 0,
@@ -3463,17 +5125,21 @@ class Wallet
      *
      * Checks all pending melt operations against the mint and updates
      * proof states accordingly:
-     * - PAID: Mark input proofs as SPENT, recover change proofs, delete pending op
-     * - UNPAID + expired: Mark input proofs as UNSPENT, delete pending op
+     * - PAID: Mark input proofs as SPENT, recover change proofs (quote `change`, else
+     *   NUT-09 on the journaled blank outputs), delete pending op
+     * - UNPAID + expired (or no expiry and journal older than MELT_RELEASE_AFTER)
+     *   AND the mint confirms every input UNSPENT (NUT-07, full coverage, Y-matched):
+     *   release inputs, delete pending op. Fail closed otherwise.
      * - PENDING or UNPAID + not expired: Keep as-is for next check
+     * - Quote unknown to the mint (`unknown_quote`): inputs UNSPENT → restored; SPENT →
+     *   change via NUT-09, then paid; otherwise kept
+     * - PAID with change that can never be unblinded: finalized anyway (inputs SPENT),
+     *   counted in `change_unrecoverable` and described in `warnings`
      *
      * @return array{
-     *   checked: int,
-     *   paid: int,
-     *   restored: int,
-     *   still_pending: int,
-     *   change_recovered: int,
-     *   errors: array<string, string>
+     *   checked: int, paid: int, restored: int, still_pending: int, change_recovered: int,
+     *   unknown_quote: int, change_unrecoverable: int,
+     *   errors: array<string, string>, warnings: array<string, string>
      * }
      */
     public function recoverPendingMelts(): array
@@ -3484,7 +5150,10 @@ class Wallet
             'restored' => 0,
             'still_pending' => 0,
             'change_recovered' => 0,
+            'unknown_quote' => 0,
+            'change_unrecoverable' => 0,
             'errors' => [],
+            'warnings' => [],
         ];
 
         // Early return if no storage
@@ -3508,26 +5177,62 @@ class Wallet
                 continue;
             }
             $quoteId = substr($pendingId, 5);
+            $inputSecrets = $op['data']['input_secrets'] ?? [];
 
             try {
+                // Journals written before input reservation existed left their inputs
+                // UNSPENT locally; adopt them so the finalizer can own them.
+                $this->adoptLegacyReservedInputs($inputSecrets);
+
                 // Check quote status with mint
-                $quote = $this->checkMeltQuote($quoteId);
+                try {
+                    $quote = $this->checkMeltQuote($quoteId);
+                } catch (CashuProtocolException $e) {
+                    if (!$e->isQuoteNotFound()) {
+                        throw $e;
+                    }
+                    // The mint forgot the quote. Our inputs tell us what happened.
+                    $result['unknown_quote']++;
+                    $settled = $this->settleMeltWithoutQuote($pendingId, $op['data']);
+                    if ($settled === null) {
+                        $result['still_pending']++;
+                    } elseif ($settled['paid']) {
+                        $result['paid']++;
+                        $result['change_recovered'] += $settled['change'];
+                        if (!empty($settled['unmappable'])) {
+                            $result['change_unrecoverable']++;
+                            $result['warnings'][$quoteId] = 'Paid; some melt change could not be recovered: '
+                                . implode('; ', array_unique($settled['unmappable']));
+                        }
+                    } else {
+                        $result['restored']++;
+                    }
+                    continue;
+                }
+                if ($quote->quote !== $quoteId) {
+                    throw new CashuException('Mint returned a quote for a different ID');
+                }
                 $state = strtoupper($quote->state);
 
                 if ($state === 'PAID') {
-                    // Payment successful - mark proofs as spent
-                    $inputSecrets = $op['data']['input_secrets'] ?? [];
-                    if (!empty($inputSecrets)) {
-                        $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-                    }
-
-                    // Recover change proofs if available
-                    $changeAmount = $this->recoverMeltChange($op['data'], $quote);
-                    $result['change_recovered'] += $changeAmount;
-
-                    // Clean up pending operation
-                    $this->storage->deletePendingOperation($pendingId);
+                    // Change the mint signed in a form we can never unblind (e.g. an amount
+                    // without a key) is lost either way; keeping the journal for it would
+                    // leave the spent inputs PENDING forever. Finalize and say so.
+                    $unmappable = [];
+                    $changeProofs = $this->recoverMeltChange($op['data'], $quote, $unmappable);
+                    $this->storage->finalizePendingSpend(
+                        $pendingId,
+                        $inputSecrets,
+                        ProofState::SPENT,
+                        $changeProofs
+                    );
+                    $result['change_recovered'] += self::sumProofs($changeProofs);
                     $result['paid']++;
+                    if (!empty($unmappable)) {
+                        $result['change_unrecoverable']++;
+                        $result['warnings'][$quoteId] = 'Paid; some melt change could not be recovered: '
+                            . implode('; ', array_unique($unmappable));
+                    }
 
                 } elseif ($state === 'PENDING') {
                     // Still in progress - keep for next check
@@ -3536,25 +5241,31 @@ class Wallet
                 } elseif ($state === 'UNPAID') {
                     // Check if quote has expired
                     $now = time();
-                    $expired = $quote->expiry !== null && $quote->expiry < $now;
+                    // A quote without an expiry never "expires"; once our melt request
+                    // can no longer be in flight, the inputs' state decides instead.
+                    $expired = $quote->expiry !== null
+                        ? $quote->expiry < $now
+                        : (int)($op['created_at'] ?? $now) < $now - self::MELT_RELEASE_AFTER;
 
-                    if ($expired) {
-                        // Quote expired - restore proofs to UNSPENT
-                        $inputSecrets = $op['data']['input_secrets'] ?? [];
-                        if (!empty($inputSecrets)) {
-                            $this->storage->updateProofsState($inputSecrets, ProofState::UNSPENT);
-                        }
-                        $this->storage->deletePendingOperation($pendingId);
+                    if ($expired && $this->inputsConfirmedUnspent($inputSecrets)) {
+                        // An expired unpaid quote is necessary but not sufficient to hand
+                        // the inputs back: our melt POST may have been received. Only the
+                        // mint confirming every input still UNSPENT proves it was not.
+                        $this->storage->finalizePendingSpend(
+                            $pendingId,
+                            $inputSecrets,
+                            ProofState::UNSPENT
+                        );
                         $result['restored']++;
                     } else {
-                        // Not expired yet - user might still complete payment
+                        // Not expired yet, or the mint could not confirm the inputs
                         $result['still_pending']++;
                     }
                 } else {
                     // Unknown state - keep for next check
                     $result['still_pending']++;
                 }
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $result['errors'][$quoteId] = $e->getMessage();
             }
         }
@@ -3563,26 +5274,104 @@ class Wallet
     }
 
     /**
+     * Seconds after which a melt journal on an UNPAID quote without expiry may release
+     * its inputs (after the mint confirms them UNSPENT). Well past melt()'s 120 s request.
+     */
+    public const MELT_RELEASE_AFTER = 600;
+
+    /**
+     * Journals written by the pre-reservation implementation did not mark their inputs
+     * PENDING. Move such inputs UNSPENT → PENDING so the journal owns them; rows in any
+     * other state are left alone (the finalizer then reports them).
+     */
+    private function adoptLegacyReservedInputs(array $inputSecrets): void
+    {
+        if (empty($inputSecrets)) {
+            return;
+        }
+        $this->storage->transitionProofStates($inputSecrets, ProofState::PENDING, [ProofState::UNSPENT]);
+    }
+
+    /**
+     * Settle a melt journal whose quote the mint no longer knows: inputs all UNSPENT →
+     * released; all SPENT → the melt ran, so collect change via NUT-09 and mark them
+     * SPENT. Anything else (mixed, PENDING, unreadable) returns null and keeps it.
+     *
+     * @return array{paid: bool, change: int, unmappable?: string[]}|null
+     */
+    private function settleMeltWithoutQuote(string $pendingId, array $data): ?array
+    {
+        $secrets = $data['input_secrets'] ?? [];
+        if (empty($secrets)) {
+            return null;
+        }
+        $states = array_values(array_unique($this->inputStatesBySecret($secrets)));
+        if ($states === [ProofState::UNSPENT]) {
+            $this->storage->finalizePendingSpend($pendingId, $secrets, ProofState::UNSPENT);
+            return ['paid' => false, 'change' => 0];
+        }
+        if ($states === [ProofState::SPENT]) {
+            $unmappable = [];
+            $change = empty($data['amounts']) ? [] : $this->recoverPendingOutputs($data, false, $unmappable);
+            $this->storage->finalizePendingSpend($pendingId, $secrets, ProofState::SPENT, $change);
+            return ['paid' => true, 'change' => self::sumProofs($change), 'unmappable' => $unmappable];
+        }
+        return null;
+    }
+
+    /**
+     * Ask the mint whether every one of these proofs is still UNSPENT.
+     *
+     * Used before releasing a journal's reserved inputs: an incomplete or unrecognized
+     * answer means "do not release", never "safe to release".
+     *
+     * @param string[] $secrets
+     */
+    private function inputsConfirmedUnspent(array $secrets): bool
+    {
+        if (empty($secrets)) {
+            return false;
+        }
+        try {
+            foreach ($this->inputStatesBySecret($secrets) as $state) {
+                if ($state !== ProofState::UNSPENT) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
      * Recover change proofs from a completed melt operation
      *
      * @param array $pendingData Pending operation data with counter_start, keyset_id, amounts
      * @param MeltQuote $quote Quote response containing change signatures
-     * @return int Total amount of recovered change (in unit)
+     * @param string[]|null $unmappable When given, change signatures that can never be
+     *        unblinded (wrong keyset, amount without a key, bad DLEQ) are skipped and
+     *        described here instead of failing the whole recovery; transport errors
+     *        still throw. Without it, any bad signature throws.
+     * @return Proof[] Recovered change proofs (not yet stored)
      */
-    private function recoverMeltChange(array $pendingData, MeltQuote $quote): int
+    private function recoverMeltChange(array $pendingData, MeltQuote $quote, ?array &$unmappable = null): array
     {
-        // No change signatures in quote response
-        if (empty($quote->change)) {
-            return 0;
-        }
-
         $counterStart = $pendingData['counter_start'] ?? null;
         $keysetId = $pendingData['keyset_id'] ?? null;
         $amounts = $pendingData['amounts'] ?? [];
 
         // Need counter data to regenerate blinding factors
         if ($counterStart === null || $keysetId === null || empty($amounts)) {
-            return 0;
+            return [];
+        }
+
+        // NUT-05/NUT-23 only define `change` on the POST /v1/melt/bolt11 response.
+        // Nutshell also returns it on GET, but other mints do not; falling straight
+        // through to "no change" would silently burn the fee-reserve refund. Ask the
+        // mint via NUT-09 whether it signed our blank outputs before giving up.
+        if (empty($quote->change)) {
+            return $this->recoverPendingOutputs($pendingData, false, $unmappable);
         }
 
         // Rebuild blinding data from stored counter range
@@ -3592,34 +5381,466 @@ class Wallet
             $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
         }
 
-        // Unblind change signatures and store proofs
-        $changeProofs = [];
-        $totalAmount = 0;
+        if ($unmappable === null) {
+            return $this->unblindMeltChange($quote->change, $blindingData, $keysetId);
+        }
+        $skipped = [];
+        $proofs = $this->unblindMeltChange($quote->change, $blindingData, $keysetId, $skipped);
+        if (!empty($skipped)) {
+            // The quote's copy of the change is unusable; NUT-09 on our blank outputs is
+            // the mint's own record and may still yield all of it.
+            $restored = [];
+            $proofs2 = $this->recoverPendingOutputs($pendingData, false, $restored);
+            if (self::sumProofs($proofs2) > self::sumProofs($proofs)) {
+                [$proofs, $skipped] = [$proofs2, $restored];
+            }
+        }
+        array_push($unmappable, ...$skipped);
+        return $proofs;
+    }
 
-        foreach ($quote->change as $i => $sig) {
-            if (!isset($blindingData[$i])) {
+    /**
+     * Resolve mint operations left unfinished by a crash, timeout or lost response.
+     *
+     *  - the mint says ISSUED — it signed our outputs and the proofs are *ours*, we just
+     *    never received them. NUT-09 restores them from the journalled plan.
+     *  - the mint says PAID but not issued — finish the mint now (the recorded plan is
+     *    reused, so the same outputs are submitted).
+     *  - the mint says the quote expired unpaid, or no longer knows it — NUT-09 decides:
+     *    none of the plan signed → the journal is retired; all signed → stored.
+     *
+     * Anything else (still payable, unreachable, an answer we do not understand) is left
+     * alone: a journal is cheap, and deleting one that still owns money is not.
+     *
+     * @return array{checked:int, recovered:int, amount:int, retired:int, unknown_quote:int, still_pending:int, errors:array}
+     */
+    public function recoverPendingMints(): array
+    {
+        $result = ['checked' => 0, 'recovered' => 0, 'amount' => 0, 'retired' => 0, 'unknown_quote' => 0,
+            'still_pending' => 0, 'errors' => []];
+        if (!$this->storage) {
+            return $result;
+        }
+
+        foreach ($this->storage->getPendingOperations('mint') as $op) {
+            $result['checked']++;
+            $id = $op['id'];
+
+            // Journal ids are "mint:<quoteId>".
+            if (!str_starts_with($id, 'mint:')) {
+                $result['errors'][$id] = 'Unrecognized mint operation id';
                 continue;
             }
+            $quoteId = substr($id, 5);
 
-            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
-            $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
+            try {
+                // Already completed locally: the proofs are stored, only the journal is
+                // stale. (storeProofs records the quote id on each minted proof.)
+                if ($this->storage->getProofsByQuoteId($quoteId)) {
+                    $this->storage->deletePendingOperation($id);
+                    $result['retired']++;
+                    continue;
+                }
 
-            $proof = new Proof(
-                $sig['id'],
-                $sig['amount'],
-                $blindingData[$i]['secret'],
-                $C
+                try {
+                    $quote = $this->checkMintQuote($quoteId);
+                } catch (CashuProtocolException $e) {
+                    if (!$e->isQuoteNotFound()) {
+                        throw $e;
+                    }
+                    // The mint no longer knows the quote, so it cannot issue on it. Our
+                    // outputs could only exist if it issued before forgetting: ask.
+                    if ($this->settleMintJournalByRestore($id, $quoteId, $op['data'], $result) === 'retired') {
+                        $result['unknown_quote']++;
+                    }
+                    continue;
+                }
+                if ($quote->quote !== $quoteId) {
+                    throw new CashuException('Mint returned a quote for a different ID');
+                }
+
+                if ($quote->isPaid() && !$quote->isIssued() && !$this->requiresRecovery()) {
+                    // Paid but never issued: finish the mint. mint() reuses the recorded plan.
+                    $amount = array_sum($op['data']['amounts'] ?? []);
+                    $proofs = $this->mint($quoteId, $amount);
+                    $result['recovered']++;
+                    $result['amount'] += self::sumProofs($proofs);
+                    continue;
+                }
+
+                if ($quote->isIssued()) {
+                    // The mint signed these exact outputs. Ask for them back.
+                    $proofs = $this->recoverPendingOutputs($op['data']);
+                    if (count($proofs) !== count($op['data']['amounts'] ?? [])) {
+                        // Incomplete: keep the journal rather than finalize a partial set.
+                        $result['still_pending']++;
+                        continue;
+                    }
+                    $this->storage->finalizePendingMint($quoteId, $op['data'], $proofs);
+                    $result['recovered']++;
+                    $result['amount'] += self::sumProofs($proofs);
+                    continue;
+                }
+
+                // Expired and unpaid per the quote. The quote's accounting is not proof the
+                // mint signed nothing (a crash between signing and the quote update), so
+                // NUT-09 decides, exactly as for a forgotten quote.
+                $expired = $quote->expiry !== null && $quote->expiry < time();
+                if ($expired && !$quote->isPaid()) {
+                    $this->settleMintJournalByRestore($id, $quoteId, $op['data'], $result);
+                    continue;
+                }
+
+                $result['still_pending']++;
+            } catch (\Throwable $e) {
+                $result['still_pending']++;
+                $result['errors'][$quoteId] = $e->getMessage();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Settle a mint journal the mint can no longer issue on, by NUT-09: none of the plan
+     * signed → retire; all signed → store them; partial → keep.
+     *
+     * @return string retired, recovered or still_pending (also counted in $result)
+     */
+    private function settleMintJournalByRestore(string $id, string $quoteId, array $plan, array &$result): string
+    {
+        $proofs = $this->recoverPendingOutputs($plan);
+        if (empty($proofs)) {
+            $this->storage->deletePendingOperation($id);
+            $outcome = 'retired';
+        } elseif (count($proofs) === count($plan['amounts'] ?? [])) {
+            $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
+            $result['amount'] += self::sumProofs($proofs);
+            $outcome = 'recovered';
+        } else {
+            $outcome = 'still_pending';
+        }
+        $result[$outcome]++;
+        return $outcome;
+    }
+
+    /** Only a definitive protocol rejection may release or replace a journal's plan. */
+    private static function isDefinitiveRejection(\Throwable $e): bool
+    {
+        return $e instanceof CashuProtocolException && $e->isDefinitive();
+    }
+
+    /**
+     * NUT-07 states of stored input secrets, matched by Y.
+     *
+     * @param string[] $secrets
+     * @return array<string, string> secret => state ('' when the mint sent none)
+     * @throws CashuException on a short, reordered or duplicated answer
+     */
+    private function inputStatesBySecret(array $secrets): array
+    {
+        $Ys = [];
+        foreach ($secrets as $secret) {
+            $Ys[$secret] = bin2hex(Secp256k1::compressPoint(Crypto::hashToCurve($secret)));
+        }
+        $states = $this->fetchStatesByY(array_values($Ys));
+        $result = [];
+        foreach ($Ys as $secret => $Y) {
+            $result[(string)$secret] = $states[$Y] ?? '';
+        }
+        return $result;
+    }
+
+    /**
+     * Decide a swap journal from the mint's authoritative answers (see
+     * recoverPendingSwaps()). $rejected: the recorded plan was just definitively
+     * rejected. $direct: the caller of swap()/receive() is present and gets an
+     * exception, so inputs this journal imported are removed instead of released.
+     *
+     * @return array{outcome: string, proofs?: Proof[]} outcome: recovered, released,
+     *         double_spent, resubmit or still_pending
+     * @throws CashuException when the mint's answers are unreadable (journal kept)
+     */
+    private function resolveSwapJournal(string $id, array $data, bool $rejected, bool $direct): array
+    {
+        $secrets = $data['input_secrets'] ?? [];
+        if (empty($secrets)) {
+            return ['outcome' => 'still_pending'];
+        }
+        $states = $this->inputStatesBySecret($secrets);
+        foreach ($states as $state) {
+            if ($state !== ProofState::SPENT && $state !== ProofState::UNSPENT) {
+                // PENDING at the mint: an operation on these inputs is in flight.
+                return ['outcome' => 'still_pending', 'reason' => 'inputs_pending'];
+            }
+        }
+        $proofs = $this->recoverPendingOutputs($data);
+        $spent = count(array_filter($states, fn($state) => $state === ProofState::SPENT));
+
+        if ($spent === count($states) && count($proofs) === count($data['amounts'] ?? []) && !empty($proofs)) {
+            $this->storage->finalizePendingSpend($id, $secrets, ProofState::SPENT, $proofs);
+            return ['outcome' => 'recovered', 'proofs' => $proofs];
+        }
+        if (!empty($proofs)) {
+            // Some of our outputs are signed but not all, or inputs are not all spent:
+            // not a state a swap can reach. Keep everything for inspection.
+            return ['outcome' => 'still_pending'];
+        }
+        if ($spent === 0 && !$rejected) {
+            return ['outcome' => 'resubmit'];
+        }
+
+        // Nothing of ours was signed and the mint says the swap cannot happen (it
+        // rejected the plan, or some inputs are already spent by someone else).
+        $imported = array_flip($data['imported_secrets'] ?? []);
+        $outcome = [];
+        foreach ($states as $secret => $state) {
+            if ($direct && isset($imported[$secret])) {
+                $outcome[$secret] = null;
+            } else {
+                $outcome[$secret] = $state === ProofState::SPENT ? ProofState::SPENT : ProofState::UNSPENT;
+            }
+        }
+        $this->storage->settlePendingSpend($id, $secrets, $outcome, []);
+        return ['outcome' => $spent > 0 ? 'double_spent' : 'released'];
+    }
+
+    /**
+     * NUT-09 for a journal's recorded outputs. $unmappable: see recoverMeltChange().
+     *
+     * @return Proof[]
+     */
+    private function recoverPendingOutputs(array $data, bool $fixedAmounts = true, ?array &$unmappable = null): array
+    {
+        $outputs = [];
+        $blindingByOutput = [];
+        foreach (($data['amounts'] ?? []) as $i => $amount) {
+            $blinded = $this->createDeterministicBlindedMessage(
+                $data['keyset_id'],
+                $data['counter_start'] + $i
             );
-
-            $changeProofs[] = $proof;
-            $totalAmount += $sig['amount'];
+            $output = ['amount' => $amount, 'id' => $data['keyset_id'], 'B_' => $blinded['B_']];
+            $outputs[] = $output;
+            $blindingByOutput[strtolower($blinded['B_'])] = $blinded + ['id' => $data['keyset_id'], 'amount' => $amount];
+        }
+        if (empty($outputs)) {
+            return [];
         }
 
-        if (!empty($changeProofs)) {
-            $this->storage->storeProofs($changeProofs);
+        if ($unmappable !== null) {
+            $this->ensureKeysetKeys($data['keyset_id']);
         }
+        $proofs = [];
+        $limit = $this->maxArrayLength();
+        foreach (array_chunk($outputs, $limit) as $chunk) {
+            $response = $this->client->post('restore', ['outputs' => $chunk]);
+            $plan = array_intersect_key($blindingByOutput, array_flip(array_map('strtolower', array_column($chunk, 'B_'))));
+            array_push($proofs, ...$this->unblindRestoredOutputs($response, $plan, $fixedAmounts, $unmappable));
+        }
+        return $proofs;
+    }
 
-        return $totalAmount;
+    /**
+     * Validate distinct NUT-09 matches (shared with seed scans, see
+     * validateRestoreResponse()); fixed-output plans also bind denominations.
+     */
+    private function unblindRestoredOutputs(array $response, array $plan, bool $fixedAmounts, ?array &$unmappable = null): array
+    {
+        $proofs = [];
+        foreach ($this->validateRestoreResponse($response, $plan, $fixedAmounts) as [$blinded, $signature]) {
+            // A zero-amount signature on a blank melt-change output carries no value
+            // (see melt()); skip it rather than fail the whole recovery.
+            if ($signature['amount'] === 0) {
+                continue;
+            }
+            if ($unmappable === null) {
+                $proofs[] = $this->unblindRestoredSignature($blinded, $signature);
+                continue;
+            }
+            try {
+                $proofs[] = $this->unblindRestoredSignature($blinded, $signature);
+            } catch (CashuException | \TypeError | \ValueError $e) {
+                $unmappable[] = $e->getMessage();
+            }
+        }
+        return $proofs;
+    }
+
+    /**
+     * NUT-07 states matched by Y. Authoritative only when every requested Y is answered
+     * exactly once; anything else throws.
+     *
+     * @param string[] $Ys Compressed hex
+     * @return array<string, string> lower-case Y => upper-case state ('' when none sent)
+     */
+    private function fetchStatesByY(array $Ys): array
+    {
+        return array_map(fn(array $entry) => $entry['state'], $this->fetchStateEntriesByY($Ys));
+    }
+
+    /**
+     * fetchStatesByY() with the whole NUT-07 entry (state '' when the mint sent none).
+     *
+     * @return array<string, array{Y: string, state: string, witness: mixed}>
+     */
+    private function fetchStateEntriesByY(array $Ys): array
+    {
+        $result = [];
+        $Ys = array_values(array_unique(array_map('strtolower', $Ys)));
+        foreach (array_chunk($Ys, $this->maxArrayLength()) as $chunk) {
+            $response = $this->client->post('checkstate', ['Ys' => $chunk]);
+            $states = $response['states'] ?? null;
+            if (!is_array($states) || count($states) !== count($chunk)) {
+                throw new CashuException('Mint returned an incomplete proof state response');
+            }
+            $wanted = array_flip($chunk);
+            foreach ($states as $state) {
+                $Y = is_array($state) && is_string($state['Y'] ?? null) ? strtolower($state['Y']) : null;
+                if ($Y === null || !isset($wanted[$Y]) || isset($result[$Y])) {
+                    throw new CashuException('Mint returned proof states that do not match the request');
+                }
+                $result[$Y] = [
+                    'Y' => $Y,
+                    'state' => is_string($state['state'] ?? null) ? strtoupper($state['state']) : '',
+                    'witness' => $state['witness'] ?? null,
+                ];
+            }
+        }
+        return $result;
+    }
+
+    /** Default, and ceiling, for the list size of one NUT-07/NUT-09 request. */
+    public const ARRAY_CHUNK = 100;
+
+    /**
+     * Largest list one request may carry: ARRAY_CHUNK, or less when the mint's info
+     * advertises a lower `max_array_length` (NUT-06).
+     */
+    private function maxArrayLength(): int
+    {
+        $limit = self::ARRAY_CHUNK;
+        $info = is_array($this->mintInfo) ? $this->mintInfo : [];
+        $nut6 = $info['nuts']['6'] ?? null;
+        $limits = $info['limits'] ?? null;
+        $candidates = [
+            $info['max_array_length'] ?? null,
+            is_array($nut6) ? ($nut6['max_array_length'] ?? null) : null,
+            is_array($limits) ? ($limits['max_array_length'] ?? null) : null,
+        ];
+        foreach ($candidates as $advertised) {
+            if (is_int($advertised) && $advertised > 0) {
+                $limit = min($limit, $advertised);
+            }
+        }
+        return $limit;
+    }
+
+    /**
+     * Split restored proofs by their verified mint state. Only an explicit UNSPENT is
+     * spendable; PENDING or an unreadable answer parks the proof UNKNOWN.
+     *
+     * @param list<array{proof: Proof, Y: string}> $found
+     * @return array{0: Proof[], 1: Proof[], 2: Proof[], 3: ?string} unspent, spent, unknown, error
+     */
+    private function classifyRestoredProofs(array $found): array
+    {
+        if (empty($found)) {
+            return [[], [], [], null];
+        }
+        try {
+            $states = $this->fetchStatesByY(array_map(fn($f) => $f['Y'], $found));
+        } catch (\Throwable $e) {
+            // Fail closed: storing an unverified proof as UNSPENT could resurrect a
+            // long-spent one. UNKNOWN is never selectable and blocks readiness.
+            return [[], [], array_map(fn($f) => $f['proof'], $found), $e->getMessage()];
+        }
+        $unspent = $spent = $unknown = [];
+        foreach ($found as $f) {
+            $state = $states[strtolower($f['Y'])] ?? '';
+            if ($state === ProofState::UNSPENT) {
+                $unspent[] = $f['proof'];
+            } elseif ($state === ProofState::SPENT) {
+                $spent[] = $f['proof'];
+            } else {
+                $unknown[] = $f['proof'];
+            }
+        }
+        return [$unspent, $spent, $unknown, null];
+    }
+
+    /**
+     * Reconcile proofs parked UNKNOWN (for example by a restore whose state check failed)
+     * without a seed scan. After an authoritative, Y-matched NUT-07 answer, UNKNOWN rows
+     * become UNSPENT or SPENT; proofs the mint reports PENDING stay UNKNOWN. Rows in any
+     * other state, and inputs owned by an unfinished swap/melt journal, are never
+     * touched. Does not change readiness; see restoreStep().
+     *
+     * @param bool $allUnits Also reconcile the other units of this mint
+     * @return array{checked: int, unspent: int, spent: int, still_unknown: int, errors: array<string, string>}
+     */
+    public function reconcileUnknownProofs(bool $allUnits = false): array
+    {
+        $result = ['checked' => 0, 'unspent' => 0, 'spent' => 0, 'still_unknown' => 0, 'errors' => []];
+        if (!$this->storage) {
+            return $result;
+        }
+        $storages = [$this->storage];
+        if ($allUnits) {
+            $stmt = $this->storage->getPdo()->prepare(
+                'SELECT DISTINCT unit FROM cashu_restore_progress WHERE wallet_id = ? AND seed_fingerprint = ?'
+            );
+            $stmt->execute([$this->storage->getWalletId(), (string)$this->storage->getSeedFingerprint()]);
+            foreach ($stmt->fetchAll(\PDO::FETCH_COLUMN) as $unit) {
+                $sibling = $this->storage->forUnit((string)$unit);
+                if ($sibling !== $this->storage) {
+                    $storages[] = $sibling;
+                }
+            }
+        }
+        foreach ($storages as $storage) {
+            $one = $this->reconcileUnknownIn($storage);
+            foreach (['checked', 'unspent', 'spent', 'still_unknown'] as $key) {
+                $result[$key] += $one[$key];
+            }
+            if ($one['error'] !== null) {
+                $result['errors'][$storage->getUnit()] = $one['error'];
+            }
+        }
+        return $result;
+    }
+
+    /** @return array{checked: int, unspent: int, spent: int, still_unknown: int, error: ?string} */
+    private function reconcileUnknownIn(WalletStorage $storage): array
+    {
+        $rows = $storage->getProofs(ProofState::UNKNOWN);
+        $result = ['checked' => count($rows), 'unspent' => 0, 'spent' => 0, 'still_unknown' => count($rows), 'error' => null];
+        if (empty($rows)) {
+            return $result;
+        }
+        $bySecret = [];
+        foreach ($rows as $row) {
+            $bySecret[$row['secret']] = bin2hex(Secp256k1::compressPoint(Crypto::hashToCurve($row['secret'])));
+        }
+        try {
+            $states = $this->fetchStatesByY(array_values($bySecret));
+        } catch (\Throwable $e) {
+            $result['error'] = $e->getMessage();
+            return $result;
+        }
+        $toUnspent = $toSpent = [];
+        foreach ($bySecret as $secret => $Y) {
+            $state = $states[$Y] ?? '';
+            if ($state === ProofState::UNSPENT) {
+                $toUnspent[] = (string)$secret;
+            } elseif ($state === ProofState::SPENT) {
+                $toSpent[] = (string)$secret;
+            }
+        }
+        $reserved = array_flip($storage->getReservedInputSecrets());
+        $result['unspent'] = $storage->transitionProofStates($toUnspent, ProofState::UNSPENT, [ProofState::UNKNOWN], $reserved);
+        $result['spent'] = $storage->transitionProofStates($toSpent, ProofState::SPENT, [ProofState::UNKNOWN], $reserved);
+        $result['still_unknown'] = $storage->countProofsInState(ProofState::UNKNOWN);
+        return $result;
     }
 
     /**
@@ -3651,13 +5872,40 @@ class Wallet
         $this->keysets = [];
 
         foreach ($keysetsResponse['keysets'] ?? [] as $ks) {
+            if (!is_array($ks) || !is_string($ks['id'] ?? null) || $ks['id'] === '') {
+                throw new CashuException('Mint returned a malformed keyset list');
+            }
             if (($ks['unit'] ?? 'sat') === $this->unit && ($ks['active'] ?? true)) {
+                // A negative fee would make calculateFee() hand the wallet extra output
+                // value; a string would be a TypeError under strict_types.
+                $feePpk = $ks['input_fee_ppk'] ?? 0;
+                if (is_string($feePpk) && $feePpk !== '' && ctype_digit($feePpk) && strlen($feePpk) <= 9) {
+                    $feePpk = (int)$feePpk;
+                }
+                if (!is_int($feePpk) || $feePpk < 0) {
+                    throw new CashuException('Mint advertised an invalid input fee for keyset ' . $ks['id']);
+                }
                 $this->keysets[] = new Keyset(
                     $ks['id'],
-                    $ks['unit'] ?? 'sat',
+                    is_string($ks['unit'] ?? null) ? $ks['unit'] : 'sat',
                     [],
-                    $ks['active'] ?? true,
-                    $ks['input_fee_ppk'] ?? 0
+                    (bool)($ks['active'] ?? true),
+                    $feePpk
+                );
+            }
+        }
+
+        // Fail closed on keyset ID versions this wallet cannot derive NUT-13 secrets
+        // for (V2 "01..." ids, 66 hex). Issuing outputs on such a keyset would put the
+        // store's ecash on a non-standard derivation path that no seed restore can
+        // find. Active V1 keysets (if any) are preferred by getActiveKeysetId().
+        if (!empty($this->keysets)) {
+            $derivable = array_filter($this->keysets, fn(Keyset $k) => self::canDeriveSecretsFor($k->id));
+            if (empty($derivable)) {
+                $ids = implode(', ', array_map(fn(Keyset $k) => $k->id, $this->keysets));
+                throw new CashuException(
+                    "Mint's active keyset(s) for unit '{$this->unit}' use a keyset ID version this wallet "
+                    . "cannot derive secrets for ({$ids}); refusing to issue outputs on them"
                 );
             }
         }
@@ -3792,18 +6040,100 @@ class Wallet
         if (empty($this->keysets)) {
             throw new CashuException('Mint not loaded. Call loadMint() first.');
         }
-        return $this->keysets[0]->id;
+        // Only keysets whose ID version we can derive secrets for are candidates
+        // (see loadMint()); the first active one wins.
+        foreach ($this->keysets as $keyset) {
+            if ($keyset->active && self::canDeriveSecretsFor($keyset->id)) {
+                return $keyset->id;
+            }
+        }
+        throw new CashuException('Mint has no active keyset with a supported ID version');
     }
 
     /**
-     * Get public key for amount
+     * Whether NUT-13 deterministic secrets can be derived for this keyset ID:
+     * V1 hex ids ("00" + 14 hex) and legacy base64 ids. V2 ("01", 66 hex) ids
+     * need a derivation this wallet does not implement.
+     */
+    public static function canDeriveSecretsFor(string $keysetId): bool
+    {
+        if ($keysetId === '') {
+            return false;
+        }
+        if (ctype_xdigit($keysetId) && strlen($keysetId) === 16) {
+            return strtolower(substr($keysetId, 0, 2)) === '00';
+        }
+        if (ctype_xdigit($keysetId) && strlen($keysetId) === 66) {
+            return false;
+        }
+        // Legacy base64 keyset ids (12 chars)
+        return strlen($keysetId) === 12 && base64_decode($keysetId, true) !== false;
+    }
+
+    /**
+     * Get public key for amount. Lazily fetches keys for keysets that are no
+     * longer in the active /keys response (e.g. after a keyset rotation), so
+     * change/restored proofs on a rotated keyset can still be unblinded.
      */
     public function getPublicKey(string $keysetId, int $amount): string
     {
+        if (!isset($this->keys[$keysetId][$amount]) && !isset($this->keys[$keysetId])) {
+            try {
+                $this->ensureKeysetKeys($keysetId);
+            } catch (CashuException $e) {
+                // Fall through to the uniform "no key" error: a transport failure here
+                // must not be mistaken for "the mint is unreachable" by callers.
+            }
+        }
         if (!isset($this->keys[$keysetId][$amount])) {
             throw new CashuException("No public key for amount $amount in keyset $keysetId");
         }
         return $this->keys[$keysetId][$amount];
+    }
+
+    /**
+     * Ensure keys for a (possibly inactive/rotated) keyset are loaded.
+     * Fetches GET /keys/{id} on demand.
+     */
+    private function ensureKeysetKeys(string $keysetId): void
+    {
+        if (isset($this->keys[$keysetId])) {
+            return;
+        }
+        $response = $this->client->get('keys/' . urlencode($keysetId));
+        foreach ($response['keysets'] ?? [] as $ks) {
+            if (!is_array($ks) || ($ks['id'] ?? null) !== $keysetId) {
+                continue;
+            }
+            $this->keys[$keysetId] = self::normalizeKeyMap(is_array($ks['keys'] ?? null) ? $ks['keys'] : []);
+            return;
+        }
+        throw new CashuException("Mint has no keys for keyset $keysetId");
+    }
+
+    /**
+     * Announced key map (amount => pubkey, amounts as JSON object keys) to an
+     * int-keyed map of the denominations this wallet can transact.
+     *
+     * @return array<int, string>
+     */
+    private static function normalizeKeyMap(array $announced): array
+    {
+        $keys = [];
+        $maxStr = (string)PHP_INT_MAX;
+        foreach ($announced as $amount => $pubkey) {
+            if (!is_string($pubkey)) {
+                continue;
+            }
+            $amountStr = (string)$amount;
+            // Denominations beyond PHP_INT_MAX stay out of the spendable map.
+            if (ctype_digit($amountStr)
+                && (strlen($amountStr) < strlen($maxStr)
+                    || (strlen($amountStr) === strlen($maxStr) && $amountStr <= $maxStr))) {
+                $keys[(int)$amountStr] = $pubkey;
+            }
+        }
+        return $keys;
     }
 
     /**
@@ -3915,7 +6245,8 @@ class Wallet
      */
     public function checkMintQuote(string $quoteId): MintQuote
     {
-        $response = $this->client->get("mint/quote/bolt11/$quoteId");
+        // The id comes from the mint (or a stored journal): never let it change the path.
+        $response = $this->client->get('mint/quote/bolt11/' . rawurlencode($quoteId));
         return MintQuote::fromArray($response);
     }
 
@@ -3927,74 +6258,112 @@ class Wallet
      */
     public function mint(string $quoteId, int $amount): array
     {
+        if ($amount <= 0) {
+            throw new CashuException('Mint amount must be positive');
+        }
         $keysetId = $this->getActiveKeysetId();
         $amounts = self::splitAmount($amount);
 
         $this->requireSeed();
         $this->requireSafeState();
+        if (!$this->storage) {
+            throw new CashuException('Mint requires persistent storage for output journaling and recovery');
+        }
 
-        // Check for pending operation (retry case)
+        // Already completed locally (a poller re-running mint() for the same quote):
+        // return the stored proofs instead of asking the mint to issue again.
+        $completed = $this->storage->getProofsByQuoteId($quoteId);
+        if ($completed) {
+            $proofs = array_map(fn($row) => $this->proofFromRow($row), $completed);
+            if (self::sumProofs($proofs) !== $amount) {
+                throw new CashuException('Mint amount does not match the completed quote');
+            }
+            return $proofs;
+        }
+
+        // Allocate one authoritative counter range under the same lock as the journal
+        // (a retry re-finds the same plan and rebuilds byte-identical outputs).
         $pendingId = "mint:$quoteId";
-        $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
+        $plan = $this->storage->preparePendingSpend($pendingId, 'mint', [], $keysetId, $amounts);
+        if (array_sum($plan['amounts']) !== $amount) {
+            throw new CashuException('Mint amount does not match the pending plan');
+        }
+        $keysetId = $plan['keyset_id'];
+        $amounts = $plan['amounts'];
+        $this->counters[$keysetId] = max($this->counters[$keysetId] ?? 0, $plan['counter_start'] + count($amounts));
 
         $outputs = [];
         $blindingData = [];
-
-        if ($pending) {
-            // RETRY: rebuild blinding data from stored counter range
-            $counterStart = $pending['data']['counter_start'];
-            $pendingKeysetId = $pending['data']['keyset_id'];
-            $amounts = $pending['data']['amounts'];
-            foreach ($amounts as $i => $amt) {
-                $blinded = $this->createDeterministicBlindedMessage($pendingKeysetId, $counterStart + $i);
-                $outputs[] = ['amount' => $amt, 'id' => $pendingKeysetId, 'B_' => $blinded['B_']];
-                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-            }
-            $keysetId = $pendingKeysetId;
-        } else {
-            // FIRST ATTEMPT: increment counters and record pending op
-            $counterStart = $this->getCounter($keysetId);
-            foreach ($amounts as $amt) {
-                $counter = $this->nextCounter($keysetId);
-                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-                $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
-                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-            }
-            // Record pending operation before network call
-            if ($this->storage) {
-                $this->storage->savePendingOperation($pendingId, 'mint', [
-                    'counter_start' => $counterStart,
-                    'keyset_id' => $keysetId,
-                    'amounts' => $amounts,
-                ]);
-            }
+        foreach ($amounts as $i => $amt) {
+            $blinded = $this->createDeterministicBlindedMessage($keysetId, $plan['counter_start'] + $i);
+            $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+            $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
         }
 
-        // Request signatures from mint
-        $response = $this->client->post('mint/bolt11', [
-            'quote' => $quoteId,
-            'outputs' => $outputs
-        ]);
+        // Request signatures from mint. On any failure, reconcile through the quote:
+        // ISSUED means the mint signed exactly these outputs and only the response
+        // was lost — NUT-09 restores them from the journaled plan.
+        try {
+            $response = $this->client->post('mint/bolt11', [
+                'quote' => $quoteId,
+                'outputs' => $outputs
+            ]);
+        } catch (CashuException $e) {
+            try {
+                $quote = $this->checkMintQuote($quoteId);
+            } catch (CashuException $quoteError) {
+                throw $e;
+            }
+            if ($quote->quote === $quoteId && $quote->isIssued()) {
+                $proofs = $this->recoverPendingOutputs($plan);
+                if (count($proofs) !== count($outputs)) {
+                    throw new CashuException('Issued mint recovery is incomplete; journal retained');
+                }
+                $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
+                return $proofs;
+            }
+            throw $e;
+        }
+
+        // Guard: the mint must return exactly one signature per output. A short/empty set
+        // (e.g. a well-formed {"signatures":[]} body) means an incomplete response — do
+        // NOT store a partial set and delete the recovery journal, or the quote's funds
+        // would be lost / the invoice settled with zero ecash.
+        $signatures = $response['signatures'] ?? [];
+        if (!is_array($signatures) || count($signatures) !== count($outputs)) {
+            throw new CashuProtocolException(
+                'Mint returned ' . (is_array($signatures) ? count($signatures) : 0) . ' signatures for '
+                . count($outputs) . ' outputs; keeping recovery journal for retry'
+            );
+        }
 
         // Unblind signatures to create proofs
         $proofs = [];
-        foreach ($response['signatures'] ?? [] as $i => $sig) {
-            if (!isset($outputs[$i], $blindingData[$i])) {
-                throw new CashuProtocolException('Mint returned more signatures than requested outputs');
+        foreach (array_values($signatures) as $i => $sig) {
+            if (!is_array($sig) || !isset($sig['id'], $sig['amount'], $sig['C_'])
+                || !is_string($sig['id']) || !is_int($sig['amount']) || !is_string($sig['C_'])) {
+                throw new CashuProtocolException('Mint returned a malformed blind signature');
             }
-            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
-            $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
-
             // Verify amount/keyset (and DLEQ when present) before storing the
             // proof; this is the LN-invoice settle path, so an unverified mint
             // response must not settle the invoice with bad-denomination ecash.
+            // (Amount/keyset are checked before the key lookup so a wrong amount
+            // is reported as a mismatch rather than a missing key.)
+            if ((int)$sig['amount'] !== (int)$outputs[$i]['amount'] || $sig['id'] !== $outputs[$i]['id']) {
+                throw new CashuProtocolException(
+                    'Mint signed amount ' . $sig['amount'] . ' on keyset ' . $sig['id']
+                    . ' but output requested ' . $outputs[$i]['amount'] . ' on ' . $outputs[$i]['id']
+                );
+            }
+            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
+            $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
             $this->assertValidMintSignature($sig, $outputs[$i], $blindingData[$i], $C);
 
             $dleq = null;
             if (isset($sig['dleq'])) {
                 $dleq = new DLEQWallet(
-                    $sig['dleq']['e'],
-                    $sig['dleq']['s'],
+                    (string)$sig['dleq']['e'],
+                    (string)$sig['dleq']['s'],
                     Secp256k1::scalarToHex($blindingData[$i]['r'])
                 );
             }
@@ -4008,13 +6377,23 @@ class Wallet
             );
         }
 
-        // Store proofs and clean up pending operation
-        if ($this->storage) {
-            $this->storage->storeProofs($proofs, $quoteId);
-            $this->storage->deletePendingOperation($pendingId);
-        }
+        // Store proofs and retire the journal in one write transaction
+        $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
 
         return $proofs;
+    }
+
+    /** Proof object from a cashu_proofs row. */
+    private function proofFromRow(array $row): Proof
+    {
+        $dleq = null;
+        if (!empty($row['dleq'])) {
+            $dleqData = json_decode($row['dleq'], true);
+            if (is_array($dleqData) && isset($dleqData['e'], $dleqData['s'])) {
+                $dleq = new DLEQWallet((string)$dleqData['e'], (string)$dleqData['s'], (string)($dleqData['r'] ?? ''));
+            }
+        }
+        return new Proof($row['keyset_id'], (int)$row['amount'], $row['secret'], $row['C'], $dleq);
     }
 
     // ========================================================================
@@ -4039,150 +6418,337 @@ class Wallet
      */
     public function checkMeltQuote(string $quoteId): MeltQuote
     {
-        $response = $this->client->get("melt/quote/bolt11/$quoteId");
+        // The id comes from the mint (or a stored journal): never let it change the path.
+        $response = $this->client->get('melt/quote/bolt11/' . rawurlencode($quoteId));
         return MeltQuote::fromArray($response);
     }
 
     /**
      * Melt tokens to pay Lightning invoice
      *
+     * The inputs are reserved (PENDING) and the operation journaled — with the
+     * NUT-08 blank change outputs' counter range — BEFORE the POST, also when no
+     * change is possible. On any exception from the POST the melt quote decides:
+     * PAID → finalize as paid (inputs SPENT, change unblinded or recovered via
+     * NUT-09); PENDING → inputs stay PENDING, the journal is kept and the error is
+     * rethrown; UNPAID after a *definitive* mint rejection with every input confirmed
+     * UNSPENT (NUT-07) → inputs released and the error rethrown; anything else keeps
+     * the journal for recoverPendingMelts() and rethrows.
+     *
+     * Once the mint says PAID this method never throws: a change-recovery or storage
+     * failure is reported as `changeRecoveryPending` and completed later by
+     * recoverPendingMelts().
+     *
      * @param Proof[] $proofs
-     * @return array{paid: bool, preimage: ?string, change: Proof[]}
+     * @return array{paid: bool, pending: bool, state: string, preimage: ?string, change: Proof[],
+     *               changeRecoveryPending: bool, changeRecoveryError?: string}
+     *         state: the mint's melt state (PAID, PENDING, UNPAID or UNKNOWN)
      */
     public function melt(string $quoteId, array $proofs): array
     {
-        // Validate proof states before spending
-        if ($this->storage) {
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
-            foreach ($states as $secret => $state) {
-                if ($state !== ProofState::UNSPENT) {
-                    throw new CashuException("Cannot spend proof: state is $state");
-                }
-            }
+        if (!$this->storage) {
+            throw new CashuException('Melt requires persistent storage for input reservation and recovery');
         }
+        if (empty($proofs)) {
+            throw new CashuException('Melt requires at least one input proof');
+        }
+        $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
 
         $keysetId = $this->getActiveKeysetId();
         $proofsSum = self::sumProofs($proofs);
 
         // Get quote to know the amount
         $quote = $this->checkMeltQuote($quoteId);
-        $totalNeeded = $quote->amount + $quote->feeReserve;
-
-        // Calculate change amount
-        $changeAmount = $proofsSum - $totalNeeded;
-
-        // Check for pending operation (retry case)
-        $pendingId = "melt:$quoteId";
-        $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
-
-        // Create change outputs if needed
-        $outputs = [];
-        $blindingData = [];
-
-        if ($changeAmount > 0) {
-            $this->requireSeed();
-            $this->requireSafeState();
-
-            if ($pending) {
-                // RETRY: rebuild blinding data from stored counter range
-                $counterStart = $pending['data']['counter_start'];
-                $pendingKeysetId = $pending['data']['keyset_id'];
-                $changeAmounts = $pending['data']['amounts'];
-                foreach ($changeAmounts as $i => $amt) {
-                    $blinded = $this->createDeterministicBlindedMessage($pendingKeysetId, $counterStart + $i);
-                    $outputs[] = ['amount' => $amt, 'id' => $pendingKeysetId, 'B_' => $blinded['B_']];
-                    $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-                }
-                $keysetId = $pendingKeysetId;
-            } else {
-                // FIRST ATTEMPT: increment counters and record pending op
-                $changeAmounts = self::splitAmount($changeAmount);
-                $counterStart = $this->getCounter($keysetId);
-                foreach ($changeAmounts as $amt) {
-                    $counter = $this->nextCounter($keysetId);
-                    $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-                    $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
-                    $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-                }
-                // Record pending operation before network call
-                if ($this->storage) {
-                    $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-                    $this->storage->savePendingOperation($pendingId, 'melt', [
-                        'counter_start' => $counterStart,
-                        'keyset_id' => $keysetId,
-                        'amounts' => $changeAmounts,
-                        'input_secrets' => $inputSecrets,
-                    ]);
-                }
-            }
+        if ($quote->quote !== $quoteId) {
+            throw new CashuException('Mint returned a quote for a different ID');
+        }
+        if ($quote->unit !== null && strtolower($quote->unit) !== strtolower($this->unit)) {
+            throw new CashuException(
+                "Melt quote is denominated in {$quote->unit}, not {$this->unit}"
+            );
+        }
+        // NUT-02: the inputs' own fee is due on top of amount + fee reserve. A melt
+        // short of it would be rejected only after the inputs were reserved.
+        $inputFee = $this->calculateFee($proofs);
+        $totalNeeded = $quote->amount + $quote->feeReserve + $inputFee;
+        if ($proofsSum < $totalNeeded) {
+            throw new CashuException(
+                "Insufficient inputs for melt quote amount, fee reserve and input fee ($inputFee)"
+            );
         }
 
-        // Send melt request
-        $response = $this->client->post('melt/bolt11', [
+        // NUT-08: the mint returns the unused part of the fee reserve (plus any input
+        // overpayment) as blind signatures on *blank* outputs. It decomposes that amount
+        // into powers of two and signs at most as many outputs as we supplied, dropping
+        // the rest — so the wallet must supply enough blank outputs to represent the
+        // largest change it could possibly receive, and set every amount to 0.
+        $maxChange = $proofsSum - $quote->amount - $inputFee;
+        $blankCount = self::blankOutputCount($maxChange);
+
+        $pendingId = "melt:$quoteId";
+        $pending = $this->storage->getPendingOperationById($pendingId);
+
+        // Refuse to start a *new* operation against a quote the mint has already acted on.
+        // Otherwise the reconciliation below sees PAID, attributes someone else's earlier
+        // payment to the proofs supplied now, and marks those fresh proofs spent locally
+        // although the mint never consumed them.
+        if ($pending === null && !$quote->isUnpaid()) {
+            throw new CashuException(
+                "Melt quote is already {$quote->state}; it cannot be paid again with new inputs"
+            );
+        }
+
+        if ($blankCount > 0) {
+            $this->requireSeed();
+            $this->requireSafeState();
+        }
+
+        // Journal + input reservation in one write lock, BEFORE the network call —
+        // also when no change outputs are possible, so a lost response can always be
+        // reconciled against the quote.
+        if ($pending) {
+            $pendingData = $pending['data'];
+            // Journals written before input reservation existed left their inputs
+            // UNSPENT locally; adopt them so the finalizer can own them.
+            $this->adoptLegacyReservedInputs($pendingData['input_secrets'] ?? []);
+        } else {
+            $pendingData = $this->storage->preparePendingSpend(
+                $pendingId,
+                'melt',
+                $proofs,
+                $keysetId,
+                array_fill(0, $blankCount, 0),
+                ['quote_expiry' => $quote->expiry]
+            );
+        }
+        if (($pendingData['input_secrets'] ?? []) !== $inputSecrets) {
+            throw new CashuException('Pending melt inputs do not match supplied proofs');
+        }
+        $keysetId = $pendingData['keyset_id'];
+        $counterStart = $pendingData['counter_start'];
+        $changeAmounts = $pendingData['amounts'];
+        $this->counters[$keysetId] = max($this->counters[$keysetId] ?? 0, $counterStart + count($changeAmounts));
+
+        $outputs = [];
+        $blindingData = [];
+        foreach ($changeAmounts as $i => $amt) {
+            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counterStart + $i);
+            $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+            $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+        }
+
+        // Send the melt once. A Lightning melt can complete before its HTTP response
+        // reaches us, so on any failure reconcile through the authoritative melt-quote
+        // state before deciding whether to surface the error.
+        $request = [
             'quote' => $quoteId,
             'inputs' => array_map(fn($p) => $p->toArray(), $proofs),
             'outputs' => $outputs
-        ]);
+        ];
+        $reconciledQuote = null;
+        try {
+            // Lightning settlement can take well over the default 30s.
+            $response = $this->client->post('melt/bolt11', $request, 120);
+        } catch (CashuException $meltError) {
+            try {
+                $reconciled = $this->checkMeltQuote($quoteId);
+            } catch (CashuException $quoteError) {
+                // Preserve the original operation error when reconciliation fails.
+                throw $meltError;
+            }
+            if ($reconciled->quote !== $quoteId) {
+                throw $meltError;
+            }
+            if ($reconciled->isUnpaid() && self::isDefinitiveRejection($meltError)
+                && $this->inputsConfirmedUnspent($inputSecrets)) {
+                // The mint refused the melt, the quote is still unpaid and every input
+                // is unspent: nothing is in flight. Hand the inputs back now instead of
+                // at quote expiry. (A 5xx/timeout is NOT definitive: the mint may still
+                // be executing the request, so the journal and reservation stay.)
+                $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::UNSPENT);
+                throw $meltError;
+            }
+            if (!($reconciled->isPaid() || $reconciled->isPending())) {
+                throw $meltError;
+            }
+            if ($reconciled->isPending()) {
+                // In flight at the mint: inputs stay PENDING, journal kept.
+                throw $meltError;
+            }
+            $reconciledQuote = $reconciled;
+            $response = [
+                'state' => $reconciled->state,
+                'payment_preimage' => $reconciled->paymentPreimage,
+                'change' => $reconciled->change ?? [],
+            ];
+        }
 
-        // Process change
+        // The POST response was lost and the quote says PAID. GET need not carry the
+        // change the POST would have (NUT-05/NUT-08), so collect it exactly as
+        // recoverPendingMelts() does — including NUT-09 on our blank outputs — and keep
+        // the journal until that has either succeeded or definitively found nothing.
+        if ($reconciledQuote !== null && $reconciledQuote->isPaid()) {
+            $preimage = $reconciledQuote->paymentPreimage;
+            try {
+                $changeProofs = empty($changeAmounts)
+                    ? []
+                    : $this->recoverMeltChange($pendingData, $reconciledQuote);
+            } catch (\Throwable $changeError) {
+                // Paid, but the refund is still at the mint. recoverPendingMelts() retries
+                // with the retained journal; the inputs stay reserved (they are spent).
+                return [
+                    'paid' => true,
+                    'pending' => false,
+                    'state' => 'PAID',
+                    'preimage' => $preimage,
+                    'change' => [],
+                    'changeRecoveryPending' => true,
+                    'changeRecoveryError' => $changeError->getMessage(),
+                ];
+            }
+            return $this->finalizePaidMelt($pendingId, $inputSecrets, $changeProofs, $preimage);
+        }
+
+        // Check payment state first - mints may return lowercase
+        $paymentState = is_string($response['state'] ?? null) ? strtoupper($response['state']) : '';
+        $isPaid = $paymentState === 'PAID';
+        $isPending = $paymentState === 'PENDING';
+        $preimage = is_string($response['payment_preimage'] ?? null) ? $response['payment_preimage'] : null;
+
+        if (!$isPaid) {
+            // Ambiguous and unpaid responses remain reserved until quote recovery decides.
+            return [
+                'paid' => false,
+                'pending' => $isPending,
+                'state' => $paymentState !== '' ? $paymentState : ProofState::UNKNOWN,
+                'preimage' => $preimage,
+                'change' => [],
+                'changeRecoveryPending' => false,
+            ];
+        }
+
+        // The mint says PAID: the Lightning payment has gone out. From here on nothing
+        // may throw. A caller that sees an exception reasonably treats the withdrawal
+        // as failed and tries again with a new quote, which pays twice. If the change
+        // cannot be unblinded or the result cannot be saved, report the payment and
+        // keep the journal; recoverPendingMelts() collects the change through NUT-09
+        // and finalizes it later.
+        try {
+            $change = $response['change'] ?? [];
+            $changeProofs = $this->unblindMeltChange(is_array($change) ? $change : [], $blindingData, $keysetId);
+        } catch (\Throwable $changeError) {
+            return [
+                'paid' => true,
+                'pending' => false,
+                'state' => 'PAID',
+                'preimage' => $preimage,
+                'change' => [],
+                'changeRecoveryPending' => true,
+                'changeRecoveryError' => $changeError->getMessage(),
+            ];
+        }
+        return $this->finalizePaidMelt($pendingId, $inputSecrets, $changeProofs, $preimage);
+    }
+
+    /**
+     * Record a paid melt, or — if saving fails — say so without throwing. The journal
+     * written before the POST survives a failed finalization, so recovery completes it.
+     */
+    private function finalizePaidMelt(string $pendingId, array $inputSecrets, array $changeProofs, ?string $preimage): array
+    {
+        try {
+            $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::SPENT, $changeProofs);
+        } catch (\Throwable $finalizeError) {
+            return [
+                'paid' => true,
+                'pending' => false,
+                'state' => 'PAID',
+                'preimage' => $preimage,
+                'change' => [],
+                'changeRecoveryPending' => true,
+                'changeRecoveryError' => 'The payment went through but could not be recorded yet: '
+                    . $finalizeError->getMessage(),
+            ];
+        }
+        return [
+            'paid' => true,
+            'pending' => false,
+            'state' => 'PAID',
+            'preimage' => $preimage,
+            'change' => $changeProofs,
+            'changeRecoveryPending' => false,
+        ];
+    }
+
+    /**
+     * Unblind the change a PAID melt response carries (NUT-08).
+     *
+     * @return Proof[]
+     */
+    private function unblindMeltChange(
+        array $changeSignatures,
+        array $blindingData,
+        string $keysetId,
+        ?array &$unmappable = null
+    ): array {
         $changeProofs = [];
-        foreach ($response['change'] ?? [] as $i => $sig) {
-            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
+        $changeSignatures = array_values($changeSignatures);
+        if (count($changeSignatures) > count($blindingData)) {
+            if ($unmappable === null) {
+                throw new CashuException('Mint returned more melt change signatures than prepared outputs');
+            }
+            $unmappable[] = 'Mint returned more melt change signatures than prepared outputs';
+            $changeSignatures = array_slice($changeSignatures, 0, count($blindingData));
+        }
+        if ($unmappable !== null) {
+            // Load the keys up front: a failure here is transport, not a bad signature,
+            // and must keep the journal for a retry.
+            $this->ensureKeysetKeys($keysetId);
+        }
+        foreach ($changeSignatures as $i => $sig) {
+            if ($unmappable !== null) {
+                try {
+                    array_push($changeProofs, ...$this->unblindMeltChange([$sig], [$blindingData[$i]], $keysetId));
+                } catch (CashuException | \TypeError | \ValueError $e) {
+                    $unmappable[] = $e->getMessage();
+                }
+                continue;
+            }
+            // NUT-08: the mint ignores the amounts on the wallet's change outputs and
+            // assigns its own (the decomposed overpaid fees), so only the keyset and
+            // output count can be validated — not the amounts.
+            $changeAmount = is_array($sig) ? ($sig['amount'] ?? null) : null;
+            if (!isset($blindingData[$i])
+                || !is_array($sig)
+                || ($sig['id'] ?? null) !== $keysetId
+                || !is_int($changeAmount) || $changeAmount < 0
+                || !is_string($sig['C_'] ?? null)) {
+                throw new CashuException('Mint returned melt change that does not match the prepared outputs');
+            }
+            // Some mints sign unused blank outputs with amount 0 (the spec says they
+            // should omit them). Such a signature carries no value and has no key to
+            // unblind with. Its counter was reserved with the others.
+            if ($changeAmount === 0) {
+                continue;
+            }
+            $pubkey = $this->getPublicKey($sig['id'], $changeAmount);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
+            // NUT-12: verify the DLEQ proof when the mint supplies one.
+            $this->assertValidMintSignature(
+                $sig,
+                ['amount' => $changeAmount, 'id' => $keysetId],
+                $blindingData[$i],
+                $C
+            );
 
             $changeProofs[] = new Proof(
                 $sig['id'],
-                $sig['amount'],
+                $changeAmount,
                 $blindingData[$i]['secret'],
                 $C
             );
         }
-
-        // Check payment state - mints may return lowercase
-        $paymentState = strtoupper($response['state'] ?? '');
-        $isPaid = $paymentState === 'PAID';
-        $isPending = $paymentState === 'PENDING';
-
-        // Auto-persist proof states to storage
-        if ($this->storage) {
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-
-            if ($isPaid) {
-                // Payment successful - mark proofs as spent, store change, clean up
-                $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-
-                if (!empty($changeProofs)) {
-                    $this->storage->storeProofs($changeProofs);
-                }
-
-                $this->storage->deletePendingOperation($pendingId);
-            } elseif ($isPending) {
-                // Payment in progress - mark proofs as pending, keep pending op for recovery
-                $this->storage->updateProofsState($inputSecrets, ProofState::PENDING);
-                // Ensure pending operation exists for recovery (covers no-change case)
-                if (!$pending) {
-                    $this->storage->savePendingOperation($pendingId, 'melt', [
-                        'counter_start' => $counterStart ?? 0,
-                        'keyset_id' => $keysetId,
-                        'amounts' => $changeAmounts ?? [],
-                        'input_secrets' => $inputSecrets,
-                    ]);
-                }
-                // Don't store change yet - payment hasn't completed
-                // Don't delete pending operation - needed for recovery/retry
-                $changeProofs = []; // Clear change - not valid until payment completes
-            }
-            // If neither PAID nor PENDING (e.g., UNPAID/failed), leave proofs as UNSPENT
-            // and don't delete pending operation
-        }
-
-        return [
-            'paid' => $isPaid,
-            'pending' => $isPending,
-            'preimage' => $response['payment_preimage'] ?? null,
-            'change' => $changeProofs
-        ];
+        return $changeProofs;
     }
 
     // ========================================================================
@@ -4196,7 +6762,7 @@ class Wallet
      * @param int[] $amounts Desired output amounts
      * @return Proof[]
      */
-    public function swap(array $proofs, array $amounts): array
+    public function swap(array $proofs, array $amounts, array $reservableStates = [ProofState::UNSPENT]): array
     {
         $keysetId = $this->getActiveKeysetId();
         $inputSum = self::sumProofs($proofs);
@@ -4211,58 +6777,77 @@ class Wallet
         $this->requireSeed();
         $this->requireSafeState();
 
-        // Validate proof states before spending
-        $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-        if ($this->storage) {
-            $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
-            foreach ($states as $secret => $state) {
-                if ($state !== ProofState::UNSPENT) {
-                    throw new CashuException("Cannot spend proof: state is $state");
-                }
-            }
+        if (!$this->storage) {
+            throw new CashuException('Swap requires persistent storage for input reservation and recovery');
         }
 
         // Crash/timeout safety (mirrors mint()/melt()): a swap that the mint
         // signs but whose response we never receive would otherwise lose the
         // new output proofs forever — their deterministic secrets exist only in
-        // the advanced counter, with no record of WHICH counters were used. We
-        // persist a pending operation BEFORE the network call so the output
-        // range is recoverable (see recoverPendingSwaps()). The op id is derived
-        // from the input secrets so a retry of the same swap re-finds it and
-        // rebuilds byte-identical outputs instead of advancing the counter again.
+        // the advanced counter, with no record of WHICH counters were used. The
+        // journal (with the inputs reserved PENDING and the counter range) is
+        // written BEFORE the network call so the output range is recoverable
+        // (see recoverPendingSwaps()). The op id is derived from the input
+        // secrets so a retry of the same swap re-finds it and rebuilds
+        // byte-identical outputs instead of advancing the counter again.
+        $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
         $pendingId = 'swap:' . substr(hash('sha256', implode(',', $inputSecrets)), 0, 48);
-        $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
+        $pending = $this->storage->getPendingOperationById($pendingId);
+        if ($pending) {
+            $pendingData = $pending['data'];
+            $this->adoptLegacyReservedInputs($pendingData['input_secrets'] ?? []);
+        } else {
+            $pendingData = $this->storage->preparePendingSpend(
+                $pendingId,
+                'swap',
+                $proofs,
+                $keysetId,
+                $amounts,
+                [],
+                $reservableStates
+            );
+        }
+        if (($pendingData['amounts'] ?? []) !== array_values($amounts)) {
+            throw new CashuException('Pending swap outputs do not match requested amounts');
+        }
+        $this->counters[$pendingData['keyset_id']] = max(
+            $this->counters[$pendingData['keyset_id']] ?? 0,
+            $pendingData['counter_start'] + count($pendingData['amounts'])
+        );
 
+        try {
+            return $this->submitPreparedSwap($pendingId, $proofs, $pendingData);
+        } catch (CashuException $e) {
+            if (!self::isDefinitiveRejection($e)) {
+                // Timeout, 5xx, garbled reply: the mint may have executed the swap.
+                // The journal stays for recoverPendingSwaps().
+                throw $e;
+            }
+            // The mint refused. Settle now instead of leaving a permanent journal and
+            // PENDING rows: a replayed swap that already succeeded is recovered, a
+            // double-spent token is recorded, a refused plan releases the inputs.
+            try {
+                $outcome = $this->resolveSwapJournal($pendingId, $pendingData, true, true);
+            } catch (\Throwable $ignored) {
+                throw $e;
+            }
+            if ($outcome['outcome'] === 'recovered') {
+                return $outcome['proofs'];
+            }
+            throw $e;
+        }
+    }
+
+    /** Submit an already journaled swap using its exact deterministic outputs. */
+    private function submitPreparedSwap(string $pendingId, array $proofs, array $pendingData): array
+    {
+        $keysetId = $pendingData['keyset_id'];
         $outputs = [];
         $blindingData = [];
-
-        if ($pending) {
-            // RETRY: rebuild blinding data from the recorded counter range.
-            $counterStart = $pending['data']['counter_start'];
-            $keysetId = $pending['data']['keyset_id'];
-            $amounts = $pending['data']['amounts'];
-            foreach ($amounts as $i => $amt) {
-                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counterStart + $i);
-                $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
-                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-            }
-        } else {
-            // FIRST ATTEMPT: advance counters, record the pending op, THEN call.
-            $counterStart = $this->getCounter($keysetId);
-            foreach ($amounts as $amt) {
-                $counter = $this->nextCounter($keysetId);
-                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-                $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
-                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-            }
-            if ($this->storage) {
-                $this->storage->savePendingOperation($pendingId, 'swap', [
-                    'counter_start' => $counterStart,
-                    'keyset_id' => $keysetId,
-                    'amounts' => $amounts,
-                    'input_secrets' => $inputSecrets,
-                ]);
-            }
+        foreach (($pendingData['amounts'] ?? []) as $i => $amount) {
+            $blinded = $this->createDeterministicBlindedMessage($keysetId, $pendingData['counter_start'] + $i);
+            $outputs[] = ['amount' => $amount, 'id' => $keysetId, 'B_' => $blinded['B_']];
+            $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amount];
         }
 
         // Send swap request
@@ -4271,11 +6856,31 @@ class Wallet
             'outputs' => $outputs
         ]);
 
+        // A 2xx swap MUST return one blind signature per output. Fewer (e.g. an
+        // empty {"signatures":[]} body) means we cannot reconstruct all outputs:
+        // do NOT mark inputs spent or delete the pending op — leave it for
+        // recoverPendingSwaps() to reconcile against the mint, so we never burn
+        // inputs without recording the corresponding outputs.
+        $signatures = $response['signatures'] ?? [];
+        if (!is_array($signatures) || count($signatures) !== count($outputs)) {
+            throw new CashuProtocolException(
+                'Swap returned ' . (is_array($signatures) ? count($signatures) : 0)
+                . ' signatures for ' . count($outputs) . ' outputs'
+            );
+        }
+
         // Unblind signatures
         $newProofs = [];
-        foreach ($response['signatures'] ?? [] as $i => $sig) {
-            if (!isset($outputs[$i], $blindingData[$i])) {
-                throw new CashuProtocolException('Mint returned more signatures than requested outputs');
+        foreach (array_values($signatures) as $i => $sig) {
+            if (!is_array($sig) || !isset($sig['id'], $sig['amount'], $sig['C_'])
+                || !is_string($sig['id']) || !is_int($sig['amount']) || !is_string($sig['C_'])) {
+                throw new CashuProtocolException('Mint returned a malformed blind signature');
+            }
+            if ((int)$sig['amount'] !== (int)$outputs[$i]['amount'] || $sig['id'] !== $outputs[$i]['id']) {
+                throw new CashuProtocolException(
+                    'Mint signed amount ' . $sig['amount'] . ' on keyset ' . $sig['id']
+                    . ' but output requested ' . $outputs[$i]['amount'] . ' on ' . $outputs[$i]['id']
+                );
             }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
@@ -4295,132 +6900,98 @@ class Wallet
             );
         }
 
-        // A 2xx swap MUST return one blind signature per output. Fewer (e.g. an
-        // empty {"signatures":[]} body) means we cannot reconstruct all outputs:
-        // do NOT mark inputs spent or delete the pending op — leave it for
-        // recoverPendingSwaps() to reconcile against the mint, so we never burn
-        // inputs without recording the corresponding outputs.
-        if (count($newProofs) !== count($outputs)) {
-            throw new CashuProtocolException(
-                'Swap returned ' . count($newProofs) . ' signatures for ' . count($outputs) . ' outputs'
-            );
-        }
-
-        // Auto-persist proof states to storage
-        if ($this->storage) {
-            $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-            $this->storage->storeProofs($newProofs);
-            $this->storage->deletePendingOperation($pendingId);
-        }
-
+        // Outputs + input transition + journal delete in one write transaction
+        $this->storage->finalizePendingSpend(
+            $pendingId,
+            $pendingData['input_secrets'],
+            ProofState::SPENT,
+            $newProofs
+        );
         return $newProofs;
     }
 
     /**
-     * Reconcile swap operations that were interrupted after the pending op was
-     * recorded but before we stored the resulting proofs (crash/timeout between
-     * the swap POST and the local write). Mirrors recoverPendingMelts().
+     * Bring every swap journal to a terminal state where the mint's answers allow it.
      *
-     * For each pending swap we ask the mint whether the input proofs were
-     * spent (NUT-07 checkstate):
-     *   - SPENT  -> the swap completed at the mint; recover the output proofs
-     *               from the recorded counter range via NUT-09 restore, store
-     *               them, mark inputs spent, clear the pending op.
-     *   - UNSPENT-> the swap never reached the mint; leave inputs UNSPENT and
-     *               drop the pending op so the funds are usable again.
-     *   - unknown/unreachable -> leave the pending op for the next run.
+     * - Inputs SPENT and the recorded outputs signed (NUT-09): the swap happened; store
+     *   the outputs (`recovered`).
+     * - Inputs UNSPENT, nothing signed: resubmit the recorded plan. If the mint
+     *   definitively rejects it, release the inputs (`restored` / `released`).
+     * - Some or all inputs SPENT but none of our outputs signed: a swap is atomic, so
+     *   someone else spent those inputs. SPENT inputs are marked SPENT, UNSPENT ones
+     *   released (`double_spent`).
+     * - Anything else — inputs PENDING at the mint, an unreadable or partial NUT-07
+     *   answer (fail closed), a transport error, some outputs signed: the journal is
+     *   kept (`still_pending` / `errors`). Nothing the mint reports SPENT is ever made
+     *   UNSPENT.
+     * - Inputs moved out of PENDING locally by someone else (e.g. an unconditional
+     *   updateProofsState()): the journal cannot be finalized; counted in `orphaned`
+     *   with an `errors` entry naming the states.
      *
-     * @return array{checked:int, recovered:int, restored:int, still_pending:int, errors:array}
+     * `restored` (kept for existing callers) equals `released`.
+     *
+     * @return array{checked: int, recovered: int, restored: int, released: int, double_spent: int,
+     *               still_pending: int, orphaned: int, errors: array<string, string>}
      */
     public function recoverPendingSwaps(): array
     {
-        $result = [
-            'checked' => 0,
-            'recovered' => 0,
-            'restored' => 0,
-            'still_pending' => 0,
-            'errors' => [],
-        ];
-
+        $result = ['checked' => 0, 'recovered' => 0, 'restored' => 0, 'released' => 0, 'double_spent' => 0,
+            'still_pending' => 0, 'orphaned' => 0, 'errors' => []];
         if (!$this->storage) {
             return $result;
         }
 
-        $pendingOps = $this->storage->getPendingOperations('swap');
-        if (empty($pendingOps)) {
-            return $result;
-        }
-
-        foreach ($pendingOps as $op) {
+        foreach ($this->storage->getPendingOperations('swap') as $op) {
             $result['checked']++;
-            $pendingId = $op['id'];
+            $secrets = $op['data']['input_secrets'] ?? [];
+            if (empty($secrets) || !isset($op['data']['keyset_id'], $op['data']['counter_start'])) {
+                $result['errors'][$op['id']] = 'incomplete pending swap data';
+                continue;
+            }
+            // Journals written before input reservation existed left their inputs
+            // UNSPENT locally; adopt them so the finalizer can own them.
+            $this->adoptLegacyReservedInputs($secrets);
+            $local = $this->storage->getProofsStatesBySecrets($secrets);
+            $moved = array_filter($secrets, fn($secret) => ($local[$secret] ?? null) !== ProofState::PENDING);
+            if (!empty($moved)) {
+                $counts = array_count_values(array_map(fn($secret) => $local[$secret] ?? 'missing', $moved));
+                $result['orphaned']++;
+                $result['errors'][$op['id']] = sprintf(
+                    'Swap journal cannot be finalized: %d of %d inputs were changed outside the journal (%s). '
+                    . 'Put them back to PENDING (or delete the journal after checking the mint) to resolve it.',
+                    count($moved), count($secrets),
+                    implode(', ', array_map(fn($state, $n) => "$n $state", array_keys($counts), $counts))
+                );
+                continue;
+            }
             try {
-                $inputSecrets = $op['data']['input_secrets'] ?? [];
-                $keysetId = $op['data']['keyset_id'] ?? null;
-                $counterStart = $op['data']['counter_start'] ?? null;
-                $amounts = $op['data']['amounts'] ?? [];
-
-                if (empty($inputSecrets) || $keysetId === null || $counterStart === null || empty($amounts)) {
-                    $result['errors'][$pendingId] = 'incomplete pending swap data';
-                    continue;
-                }
-
-                $spent = $this->inputsSpentAtMint($inputSecrets);
-                if ($spent === null) {
-                    $result['still_pending']++; // inconclusive (mint unreachable)
-                    continue;
-                }
-
-                if ($spent) {
-                    // Swap was processed: recover the outputs we never stored.
-                    $toCounter = $counterStart + count($amounts);
-                    $restored = $this->restoreTokensForRange($keysetId, $counterStart, $toCounter);
-                    if (!empty($restored)) {
-                        $this->storage->storeProofs($restored);
+                $outcome = $this->resolveSwapJournal($op['id'], $op['data'], false, false);
+                if ($outcome['outcome'] === 'resubmit') {
+                    $proofs = $this->storage->getProofsBySecretsAsObjects($secrets);
+                    try {
+                        $this->submitPreparedSwap($op['id'], $proofs, $op['data']);
+                        $outcome = ['outcome' => 'recovered'];
+                    } catch (CashuException $e) {
+                        if (!self::isDefinitiveRejection($e)) {
+                            throw $e;
+                        }
+                        $outcome = $this->resolveSwapJournal($op['id'], $op['data'], true, false);
+                        if ($outcome['outcome'] === 'still_pending') {
+                            $result['errors'][$op['id']] = $e->getMessage();
+                        }
                     }
-                    $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-                    $this->storage->deletePendingOperation($pendingId);
-                    $result['recovered']++;
-                } else {
-                    // Inputs untouched: the swap never landed. Make them usable.
-                    $this->storage->updateProofsState($inputSecrets, ProofState::UNSPENT);
-                    $this->storage->deletePendingOperation($pendingId);
+                }
+                $key = $outcome['outcome'] === 'resubmit' ? 'still_pending' : $outcome['outcome'];
+                $result[$key]++;
+                if ($key === 'released') {
                     $result['restored']++;
                 }
-            } catch (\Exception $e) {
-                $result['errors'][$pendingId] = $e->getMessage();
+            } catch (\Throwable $e) {
+                $result['still_pending']++;
+                $result['errors'][$op['id']] = $e->getMessage();
             }
         }
-
         return $result;
-    }
-
-    /**
-     * Ask the mint whether any of the given proof secrets are SPENT (NUT-07).
-     * Returns true if at least one is spent, false if all are unspent/pending,
-     * or null when the check is inconclusive (mint unreachable / empty result).
-     */
-    private function inputsSpentAtMint(array $secrets): ?bool
-    {
-        if (empty($secrets)) {
-            return null;
-        }
-        try {
-            $Ys = array_map(fn($s) => Crypto::computeY($s), $secrets);
-            $response = $this->client->post('checkstate', ['Ys' => $Ys]);
-        } catch (\Exception $e) {
-            return null;
-        }
-        $states = $response['states'] ?? [];
-        if (empty($states)) {
-            return null;
-        }
-        foreach ($states as $st) {
-            if (strtoupper($st['state'] ?? '') === 'SPENT') {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**
@@ -4524,11 +7095,8 @@ class Wallet
     public function receive(string $tokenString): array
     {
         $token = $this->deserializeToken($tokenString);
-
-        // Verify token is from this mint
-        if (rtrim($token->mint, '/') !== $this->mintUrl) {
-            throw new CashuException('Token is from a different mint');
-        }
+        self::assertNoDuplicateProofs($token->proofs);
+        $this->assertReceivable($token);
 
         // Calculate fee and output amount
         $inputAmount = $token->getAmount();
@@ -4539,9 +7107,105 @@ class Wallet
             throw new CashuException("Token amount ($inputAmount) is less than or equal to fee ($fee)");
         }
 
+        // NUT-07 first: a token that is already spent (or in flight) would be refused by
+        // the swap only after its proofs were imported and output counters reserved.
+        // Anyone can paste spent tokens, so refuse them before reserving anything.
+        if ($this->mintSupportsNut07()) {
+            $states = [];
+            try {
+                $states = $this->checkProofState($token->proofs);
+            } catch (CashuProtocolException $e) {
+                // A mint without the endpoint: the swap below is the only check left.
+                if (!in_array($e->getHttpStatus(), [404, 405, 501], true)) {
+                    throw $e;
+                }
+            }
+            foreach ($states as $state) {
+                if ($state['state'] === ProofState::SPENT) {
+                    throw new CashuProtocolException('Token already spent.', CashuProtocolException::PROOFS_ALREADY_SPENT);
+                }
+                if ($state['state'] === ProofState::PENDING) {
+                    throw new CashuProtocolException(
+                        'Token is pending at the mint (in use by another payment); try again later.',
+                        CashuProtocolException::PROOFS_PENDING
+                    );
+                }
+            }
+        }
+
         // Split output amount into powers of 2
         $amounts = self::splitAmount($outputAmount);
         return $this->swap($token->proofs, $amounts);
+    }
+
+    /**
+     * Refuse a token that lists the same proof twice.
+     *
+     * The mint rejects duplicate inputs, but only after the wallet has reserved output
+     * counters for the inflated amount. Y = hash_to_curve(secret), so equal secrets
+     * are exactly equal Ys.
+     *
+     * @param Proof[] $proofs
+     */
+    public static function assertNoDuplicateProofs(array $proofs): void
+    {
+        $seen = [];
+        foreach ($proofs as $proof) {
+            if (isset($seen[$proof->secret])) {
+                throw new CashuException('Token contains the same proof more than once');
+            }
+            $seen[$proof->secret] = true;
+        }
+    }
+
+    /** NUT-07 is optional; skip the pre-check only when the mint says it lacks it. */
+    private function mintSupportsNut07(): bool
+    {
+        $nut7 = $this->mintInfo['nuts']['7'] ?? null;
+        return !(is_array($nut7) && array_key_exists('supported', $nut7) && $nut7['supported'] === false);
+    }
+
+    /**
+     * Reject tokens this wallet cannot actually spend: another mint (compared in
+     * canonical form, so case / default port / duplicate slashes do not matter),
+     * another unit, or NUT-10 locked secrets.
+     */
+    private function assertReceivable(Token $token): void
+    {
+        try {
+            $sameMint = MintClient::canonicalizeMintUrl($token->mint)
+                === MintClient::canonicalizeMintUrl($this->mintUrl);
+        } catch (CashuException $e) {
+            $sameMint = false;
+        }
+        if (!$sameMint) {
+            throw new CashuException('Token is from a different mint');
+        }
+        if (strtolower($token->unit) !== strtolower($this->unit)) {
+            throw new CashuException(
+                "Token unit ({$token->unit}) does not match the wallet unit ({$this->unit})"
+            );
+        }
+        foreach ($token->proofs as $proof) {
+            if (self::isLockedSecret($proof->secret)) {
+                throw new CashuException(
+                    'Token is locked (NUT-10 spending condition); this wallet cannot spend it'
+                );
+            }
+        }
+    }
+
+    /** NUT-10 well-known secret: ["P2PK"|"HTLC", {"nonce":..,"data":..}]. */
+    public static function isLockedSecret(string $secret): bool
+    {
+        if ($secret === '' || $secret[0] !== '[') {
+            return false;
+        }
+        $decoded = json_decode($secret, true);
+        return is_array($decoded)
+            && isset($decoded[0])
+            && is_string($decoded[0])
+            && array_key_exists(1, $decoded);
     }
 
     /**
@@ -4563,13 +7227,11 @@ class Wallet
     public function receiveOffline(string $tokenString): array
     {
         $token = $this->deserializeToken($tokenString);
+        self::assertNoDuplicateProofs($token->proofs);
+        $this->assertReceivable($token);
 
-        // Verify token is from this mint
-        if (rtrim($token->mint, '/') !== $this->mintUrl) {
-            throw new CashuException('Token is from a different mint');
-        }
-
-        // Store proofs directly without swap
+        // Store proofs directly without swap. A proof already known to storage is
+        // never re-stored (storeProofs never resurrects a SPENT row).
         if ($this->storage) {
             $this->storage->storeProofs($token->proofs);
         } else {
@@ -4584,18 +7246,34 @@ class Wallet
     // ========================================================================
 
     /**
-     * Check the state of proofs
+     * Check the state of proofs (NUT-07).
+     *
+     * The mint's answer is matched by Y, not by position: every requested Y must be
+     * answered exactly once or this throws (fail closed). Requests are chunked to the
+     * mint's array limit.
      *
      * @param Proof[] $proofs
-     * @return array Array of state objects
+     * @return list<array{Y: string, state: string, witness: mixed}> One entry per input
+     *         proof, in input order. `state` is upper-case; ProofState::UNKNOWN when the
+     *         mint sent none — never read that as UNSPENT.
+     * @throws CashuException on a short, reordered-with-wrong-Y or duplicated answer
      */
     public function checkProofState(array $proofs): array
     {
-        $Ys = array_map(fn($p) => $p->Y, $proofs);
-
-        $response = $this->client->post('checkstate', ['Ys' => $Ys]);
-
-        return $response['states'] ?? [];
+        if (empty($proofs)) {
+            return [];
+        }
+        $Ys = array_map(fn(Proof $p) => strtolower($p->Y), array_values($proofs));
+        $entries = $this->fetchStateEntriesByY($Ys);
+        $result = [];
+        foreach ($Ys as $Y) {
+            $entry = $entries[$Y];
+            if ($entry['state'] === '') {
+                $entry['state'] = ProofState::UNKNOWN;
+            }
+            $result[] = $entry;
+        }
+        return $result;
     }
 
     // ========================================================================
@@ -4627,6 +7305,61 @@ class Wallet
         }
 
         return $selected;
+    }
+
+    /**
+     * Select proofs covering $amount *plus* the NUT-02 input fee they themselves incur.
+     *
+     * Each additional input raises the fee, so a plain selection for `amount` can come
+     * up short and the mint rejects the operation after the journal already reserved
+     * everything. Iterate until the selection covers its own cost.
+     *
+     * @param Proof[] $proofs
+     * @return Proof[]
+     */
+    public function selectProofsWithFees(array $proofs, int $amount): array
+    {
+        usort($proofs, fn($a, $b) => $b->amount - $a->amount);
+
+        $selected = [];
+        $sum = 0;
+        foreach ($proofs as $proof) {
+            if ($sum >= $amount + $this->calculateFee($selected)) {
+                break;
+            }
+            $selected[] = $proof;
+            $sum += $proof->amount;
+        }
+
+        $needed = $amount + $this->calculateFee($selected);
+        if ($sum < $needed) {
+            throw new InsufficientBalanceException("Insufficient balance: have $sum, need $needed");
+        }
+
+        return $selected;
+    }
+
+    /**
+     * NUT-08 blank output count for a melt.
+     *
+     * The mint decomposes the actual overpayment into powers of two and signs at most
+     * as many outputs as the wallet supplied, so we need one blank output per bit of
+     * the largest change we could possibly get back.
+     *
+     * @param int $maxChange Largest change the mint could return (inputs - quote amount - input fee)
+     */
+    public static function blankOutputCount(int $maxChange): int
+    {
+        if ($maxChange <= 0) {
+            return 0;
+        }
+        $bits = 0;
+        while ($maxChange > 0) {
+            $bits++;
+            $maxChange >>= 1;
+        }
+        // 64 blank outputs cover any amount representable in a signed 64-bit integer.
+        return min(max($bits, 1), 64);
     }
 
     /**
@@ -4715,13 +7448,74 @@ class Wallet
      */
     public function initFromMnemonic(string $mnemonic, string $passphrase = ''): void
     {
+        // Backward compatible: storage without a seed fingerprint is bound on first
+        // use — adopted (ready) when it already holds wallet data, initialized as a
+        // fresh seed (ready) when empty. A fingerprint bound to another seed throws.
+        $this->initializeSeed($mnemonic, $passphrase, 'existing');
+    }
+
+    /** Initialize storage for a seed guaranteed never to have been used before (ready at once). */
+    public function initializeNewFromMnemonic(string $mnemonic, string $passphrase = ''): void
+    {
+        $this->initializeSeed($mnemonic, $passphrase, 'new');
+    }
+
+    /** Bind pre-fingerprint storage that already holds this seed's history (ready at once). */
+    public function adoptSeedForExistingStorage(string $mnemonic, string $passphrase = ''): void
+    {
+        $this->initializeSeed($mnemonic, $passphrase, 'adopt');
+    }
+
+    /** Bind a fresh account for restore; mint/swap output generation stays refused until restoreStep() completes. */
+    public function initializeForRestore(string $mnemonic, string $passphrase = ''): void
+    {
+        $this->initializeSeed($mnemonic, $passphrase, 'restore');
+    }
+
+    public static function calculateSeedFingerprint(string $mnemonic, string $passphrase = ''): string
+    {
+        if (!Mnemonic::validate($mnemonic)) {
+            throw new CashuException('Invalid mnemonic phrase');
+        }
+        $seed = Mnemonic::toSeed($mnemonic, $passphrase);
+        return hash('sha256', "cashu-wallet-php seed fingerprint\0" . $seed);
+    }
+
+    private function initializeSeed(string $mnemonic, string $passphrase, string $mode): void
+    {
         if (!Mnemonic::validate($mnemonic)) {
             throw new CashuException('Invalid mnemonic phrase');
         }
 
-        $this->mnemonic = $mnemonic;
         $seed = Mnemonic::toSeed($mnemonic, $passphrase);
+        $fingerprint = self::calculateSeedFingerprint($mnemonic, $passphrase);
+
+        if ($this->storage) {
+            // A namespace (mint:unit) may serve several seeds (one per store on a
+            // multi-store server); provenance and readiness are tracked per seed.
+            $this->storage->setSeedFingerprint($fingerprint);
+            $bound = $this->storage->getSeedFingerprint() !== null;
+            if ($mode === 'existing') {
+                if (!$bound) {
+                    // Legacy storage: bind now, choosing by what it holds. A namespace
+                    // with wallet data is adopted ready (status quo for existing
+                    // installations); an empty one is a fresh seed (ready).
+                    $this->storage->bindSeedFingerprint($fingerprint, !$this->storage->hasWalletData(), true);
+                }
+            } elseif ($mode === 'new' || $mode === 'restore') {
+                // Already bound: keep its readiness as recorded (a restore-bound seed
+                // stays unready until the scan completes, a fresh one stays ready).
+                if (!$bound) {
+                    $this->storage->bindSeedFingerprint($fingerprint, true, $mode === 'new');
+                }
+            } elseif ($mode === 'adopt') {
+                $this->storage->bindSeedFingerprint($fingerprint, false, true);
+            }
+        }
+
+        $this->mnemonic = $mnemonic;
         $this->bip32 = BIP32::fromSeed($seed);
+        $this->memoryRestore = null;
 
         // Load counters from storage if available
         if ($this->storage) {
@@ -4729,6 +7523,15 @@ class Wallet
         } else {
             $this->counters = [];
         }
+    }
+
+    /** Mark the bound seed ready (fresh/adopted accounts only; see WalletStorage::markSeedReady()). */
+    public function markSeedReady(): void
+    {
+        if (!$this->storage) {
+            throw new CashuException('No storage configured');
+        }
+        $this->storage->markSeedReady();
     }
 
     /**
@@ -4795,7 +7598,12 @@ class Wallet
      */
     public function requiresRecovery(): bool
     {
-        return $this->hasSeed() && !$this->hasStorage();
+        if ($this->hasSeed() && !$this->hasStorage()) {
+            return true;
+        }
+        // Seed metadata exists and the account is not ready: an imported or
+        // reopened seed whose counters have not been recovered yet.
+        return $this->storage !== null && $this->storage->requiresRecovery();
     }
 
     /**
@@ -4823,6 +7631,13 @@ class Wallet
      */
     private function requireSafeState(): void
     {
+        if ($this->storage !== null && $this->storage->requiresRecovery()) {
+            throw new CashuException(
+                'Wallet seed requires recovery before it can issue outputs: the seed was ' .
+                'imported into storage with unknown history. Run restoreStep() until it ' .
+                'reports complete (the mint is scanned for previously used counters).'
+            );
+        }
         if ($this->requiresRecovery()) {
             throw new CashuException(
                 'Wallet initialized with seed but without storage. ' .
@@ -5030,154 +7845,652 @@ class Wallet
             throw new CashuException("Unknown keyset: $keysetId");
         }
 
-        $outputs = [];
-        $blindingData = [];
-
-        // Generate blinded messages for the counter range
-        for ($counter = $fromCounter; $counter < $toCounter; $counter++) {
-            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-
-            // We need outputs for each possible amount in the keyset
-            // NUT-09 requires sending all possible amounts for each counter
-            foreach (array_keys($this->keys[$keysetId]) as $amount) {
-                $outputs[] = [
-                    'amount' => $amount,
-                    'id' => $keysetId,
-                    'B_' => $blinded['B_']
-                ];
-
-                $blindingData[] = [
-                    'secret' => $blinded['secret'],
-                    'r' => $blinded['r'],
-                    'amount' => $amount,
-                    'counter' => $counter
-                ];
-            }
-        }
-
-        if (empty($outputs)) {
-            return [];
-        }
-
-        // POST to /v1/restore
-        $response = $this->client->post('restore', ['outputs' => $outputs]);
-
-        // Process returned signatures
         $proofs = [];
-        $returnedOutputs = $response['outputs'] ?? [];
-        $returnedSignatures = $response['signatures'] ?? [];
-
-        // Match returned signatures to our blinding data
-        for ($i = 0; $i < count($returnedSignatures); $i++) {
-            $sig = $returnedSignatures[$i];
-            $output = $returnedOutputs[$i] ?? null;
-
-            if ($sig === null || !isset($sig['C_'])) {
-                continue;
-            }
-
-            // Find matching blinding data by B_
-            $matchingData = null;
-            foreach ($blindingData as $data) {
-                // Create the blinded message again to match
-                $blinded = $this->createDeterministicBlindedMessage($keysetId, $data['counter']);
-                if ($output && $output['B_'] === $blinded['B_'] && $output['amount'] === $data['amount']) {
-                    $matchingData = $data;
-                    $matchingData['r'] = $blinded['r'];
-                    break;
-                }
-            }
-
-            if ($matchingData === null) {
-                continue;
-            }
-
-            // Unblind the signature
-            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
-            $C = Crypto::unblindSignature($sig['C_'], $matchingData['r'], $pubkey);
-
-            $proofs[] = new Proof(
-                $sig['id'],
-                $sig['amount'],
-                $matchingData['secret'],
-                $C
-            );
+        for ($counter = $fromCounter; $counter < $toCounter; $counter += self::RESTORE_BATCH) {
+            $size = min(self::RESTORE_BATCH, $toCounter - $counter);
+            $proofs = array_merge($proofs, $this->restoreBatch($keysetId, $counter, $size));
         }
-
         return $proofs;
     }
 
     /**
      * Restore tokens using a simpler approach - one output per counter
      * This is the approach used by most implementations
+     *
+     * The reply is validated before anything is accepted: a missing or malformed
+     * envelope, mismatched lengths, outputs we did not send, duplicates or
+     * signatures on another keyset throw instead of reading as "nothing here". A
+     * zero-amount signature adds no proof but still counts as a used counter in
+     * $highestCounter.
+     *
+     * @param int|null $highestCounter Raised to the highest counter the mint signed
+     * @return Proof[]
+     * @throws CashuException on a malformed restore response
      */
-    public function restoreBatch(string $keysetId, int $fromCounter, int $batchSize): array
+    public function restoreBatch(
+        string $keysetId,
+        int $fromCounter,
+        int $batchSize,
+        ?int &$highestCounter = null
+    ): array {
+        if (!$this->hasSeed()) {
+            throw new CashuException('Cannot restore: wallet not initialized with seed');
+        }
+        if ($batchSize <= 0) {
+            return [];
+        }
+
+        $proofs = [];
+        for ($done = 0; $done < $batchSize; $done += $scan['scanned']) {
+            $scan = $this->scanRestoreRange($keysetId, $fromCounter + $done, $batchSize - $done, null);
+            if ($scan['highest'] !== null && ($highestCounter === null || $scan['highest'] > $highestCounter)) {
+                $highestCounter = $scan['highest'];
+            }
+            foreach ($scan['found'] as $found) {
+                $proofs[] = $found['proof'];
+            }
+            if ($scan['scanned'] === 0) {
+                break;
+            }
+        }
+        return $proofs;
+    }
+
+    /**
+     * Blinding data for a deterministic output, including Y for NUT-07 checks.
+     *
+     * @return array{B_: string, r: BigInt, secret: string, Y: string}
+     */
+    private function deterministicBlinding(string $keysetId, int $counter): array
+    {
+        $derived = $this->generateDeterministicSecret($keysetId, $counter);
+        $Y = Crypto::hashToCurve($derived['secret']);
+        $B_ = Secp256k1::pointAdd($Y, Secp256k1::scalarMult($derived['r'], Secp256k1::getGenerator()));
+        return [
+            'B_' => bin2hex(Secp256k1::compressPoint($B_)),
+            'r' => $derived['r'],
+            'secret' => $derived['secret'],
+            'Y' => bin2hex(Secp256k1::compressPoint($Y)),
+        ];
+    }
+
+    /**
+     * Send one NUT-09 batch of at most $max counters starting at $from. Stops generating
+     * outputs once $deadline passes (after at least one), since deriving them is the
+     * expensive part on BCMath.
+     *
+     * @return array{scanned: int, found: list<array{proof: Proof, Y: string, counter: int}>,
+     *               highest: ?int, zero: int}
+     */
+    private function scanRestoreRange(string $keysetId, int $from, int $max, ?float $deadline): array
+    {
+        // Callers advance by 'scanned', so a smaller mint limit only means more requests.
+        $max = min($max, $this->maxArrayLength());
+        $outputs = [];
+        $plan = [];
+        for ($i = 0; $i < $max; $i++) {
+            if ($i > 0 && $deadline !== null && microtime(true) >= $deadline) {
+                break;
+            }
+            $counter = $from + $i;
+            $blinded = $this->deterministicBlinding($keysetId, $counter);
+            // One output per counter: the mint answers with the amount it originally
+            // signed, whatever amount we put here.
+            $outputs[] = ['amount' => 1, 'id' => $keysetId, 'B_' => $blinded['B_']];
+            $plan[strtolower($blinded['B_'])] = $blinded + ['id' => $keysetId, 'amount' => 1, 'counter' => $counter];
+        }
+        if (empty($outputs)) {
+            return ['scanned' => 0, 'found' => [], 'highest' => null, 'zero' => 0];
+        }
+
+        $response = $this->client->post('restore', ['outputs' => $outputs]);
+
+        $found = [];
+        $highest = null;
+        $zero = 0;
+        foreach ($this->validateRestoreResponse($response, $plan, false, true) as [$blinded, $signature]) {
+            // Any signature proves the counter was used, whatever its value. Resuming
+            // issuance below it would reuse the secret; ignoring zero-value ones would
+            // also shorten the gap window.
+            if ($highest === null || $blinded['counter'] > $highest) {
+                $highest = $blinded['counter'];
+            }
+            if ($signature['amount'] === 0) {
+                $zero++;
+                continue;
+            }
+            $found[] = [
+                'proof' => $this->unblindRestoredSignature($blinded, $signature),
+                'Y' => $blinded['Y'],
+                'counter' => $blinded['counter'],
+            ];
+        }
+        return ['scanned' => count($outputs), 'found' => $found, 'highest' => $highest, 'zero' => $zero];
+    }
+
+    /**
+     * Validate a NUT-09 restore reply against the outputs we sent.
+     *
+     * Shared by seed scans and journal recovery. Rejects: a missing/non-list `outputs` or
+     * `signatures`, mismatched lengths, more entries than requested, outputs we did not
+     * send (B_ compared case-insensitively), duplicates, signatures or outputs on another
+     * keyset, non-integer or negative amounts and malformed C_. Fixed-amount plans (mint
+     * and swap outputs) also bind the denominations and reject zero amounts.
+     *
+     * @param array<string, array> $plan Lower-case B_ => blinding data incl. 'id' and 'amount'
+     * @param bool $scan Seed scan: outputs may omit `id` and carry the mint's own amounts
+     * @return list<array{0: array, 1: array}> [blinding data, signature] pairs
+     * @throws CashuException
+     */
+    private function validateRestoreResponse(mixed $response, array $plan, bool $fixedAmounts, bool $scan = false): array
+    {
+        $returnedOutputs = is_array($response) ? ($response['outputs'] ?? null) : null;
+        $signatures = is_array($response) ? ($response['signatures'] ?? null) : null;
+        if (!is_array($returnedOutputs) || !is_array($signatures)
+            || !array_is_list($returnedOutputs) || !array_is_list($signatures)
+            || count($returnedOutputs) !== count($signatures)) {
+            throw new CashuException('Mint returned an incomplete restore response');
+        }
+        if (count($signatures) > count($plan)) {
+            throw new CashuException('Mint returned more restored outputs than were requested');
+        }
+
+        $matches = [];
+        $seen = [];
+        foreach ($signatures as $i => $signature) {
+            $output = $returnedOutputs[$i];
+            $key = is_array($output) && is_string($output['B_'] ?? null) ? strtolower($output['B_']) : '';
+            if (!isset($plan[$key]) || isset($seen[$key])) {
+                throw new CashuException('Mint returned duplicate or unknown restored outputs');
+            }
+            $seen[$key] = true;
+            $blinded = $plan[$key];
+            $amount = is_array($signature) ? ($signature['amount'] ?? null) : null;
+            $outputId = $output['id'] ?? null;
+            $C_ = is_array($signature) ? ($signature['C_'] ?? null) : null;
+            if (!is_array($signature)
+                || ($signature['id'] ?? null) !== $blinded['id']
+                || ($scan ? ($outputId !== null && $outputId !== $blinded['id']) : $outputId !== $blinded['id'])
+                || !is_int($amount) || $amount < 0
+                || !is_string($C_) || strlen($C_) !== 66 || !ctype_xdigit($C_)
+                || ($fixedAmounts && ($amount === 0
+                    || ($output['amount'] ?? null) !== $blinded['amount']
+                    || $amount !== $blinded['amount']))) {
+                throw new CashuException('Restored signature does not match the prepared output');
+            }
+            if (isset($signature['dleq']) && (!is_array($signature['dleq'])
+                || !is_string($signature['dleq']['e'] ?? null) || !is_string($signature['dleq']['s'] ?? null))) {
+                throw new CashuException('Restored signature carries a malformed DLEQ proof');
+            }
+            $matches[] = [$blinded + ['B_' => $key], $signature];
+        }
+        return $matches;
+    }
+
+    /** Unblind a validated, non-zero restored signature (verifying its DLEQ when present). */
+    private function unblindRestoredSignature(array $blinded, array $signature): Proof
+    {
+        $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
+        $C = Crypto::unblindSignature($signature['C_'], $blinded['r'], $pubkey);
+        $dleq = null;
+        if (isset($signature['dleq'])) {
+            // NUT-12: when the mint includes a DLEQ proof, wallets MUST verify it.
+            $this->assertValidMintSignature(
+                $signature,
+                ['amount' => $signature['amount'], 'id' => $signature['id']],
+                ['secret' => $blinded['secret'], 'r' => $blinded['r']],
+                $C
+            );
+            $dleq = new DLEQWallet(
+                (string)$signature['dleq']['e'],
+                (string)$signature['dleq']['s'],
+                Secp256k1::scalarToHex($blinded['r'])
+            );
+        }
+        return new Proof(
+            $signature['id'],
+            $signature['amount'],
+            $blinded['secret'],
+            $C,
+            $dleq
+        );
+    }
+
+    /**
+     * Advance a bounded, resumable seed recovery (NUT-09 scan of every keyset of every
+     * unit at this mint, then NUT-07 verification).
+     *
+     * Each call derives at most $maxOutputs blinded messages (at least one) and stops
+     * generating more once microtime(true) passes $deadline. Each NUT-09 batch is
+     * persisted atomically together with the recovered proofs and the monotonic counter
+     * raise, so a timeout, crash or exception resumes from the last checkpoint without
+     * duplicating proofs or lowering counters. A keyset is complete after
+     * RESTORE_GAP consecutive counters past its highest signed one came back empty.
+     *
+     * The account becomes ready only when every derivable keyset is complete and no
+     * restored proof awaits state verification; timeouts, malformed replies and checkstate
+     * outages leave it recovery-required (fail closed). A call after a completed recovery
+     * starts a new scan (a rescan never lowers counters or readiness).
+     *
+     * Recommended: GMP 200-500 outputs per call; BCMath-only hosts 10-50 outputs with a
+     * deadline a few seconds ahead.
+     *
+     * @param int $maxOutputs Blinded messages to derive and send in this call (min. 1)
+     * @param float|null $deadline microtime(true) after which no further outputs are derived
+     * @param int $gap Consecutive unsigned counters that end a keyset's scan. A running
+     *                 session never shrinks its gap (the larger of stored/requested applies).
+     *
+     * @return array{
+     *   status: string,
+     *   progress: array<string, array{unit: string, nextCounter: int, highestSigned: ?int,
+     *                                 emptyRun: int, done: bool, error: ?string}>,
+     *   error: ?string,
+     *   errors: array<string, string>,
+     *   recovered: array{outputs: int, proofs: int, unspent: int, amount: int, spent: int,
+     *                    unknown: int, zeroAmount: int},
+     *   skippedKeysets: string[],
+     *   gap: int,
+     *   ready: bool
+     * } status is 'pending' (call again), 'complete' (ready) or 'error' (retry later)
+     */
+    public function restoreStep(int $maxOutputs = 100, ?float $deadline = null, int $gap = self::RESTORE_GAP): array
     {
         if (!$this->hasSeed()) {
             throw new CashuException('Cannot restore: wallet not initialized with seed');
         }
-
-        $outputs = [];
-        $blindingData = [];
-
-        // Generate one blinded message per counter with amount=1
-        // The mint will return the actual amount in the signature
-        for ($counter = $fromCounter; $counter < $fromCounter + $batchSize; $counter++) {
-            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-
-            $outputs[] = [
-                'amount' => 1, // Placeholder amount
-                'id' => $keysetId,
-                'B_' => $blinded['B_']
-            ];
-
-            $blindingData[$blinded['B_']] = [
-                'secret' => $blinded['secret'],
-                'r' => $blinded['r'],
-                'counter' => $counter
+        $collect = self::emptyRestoreCollection();
+        try {
+            $batch = BigInt::isUsingGmp() ? self::RESTORE_BATCH : self::RESTORE_BATCH_BCMATH;
+            $step = $this->runRestore(max(1, $maxOutputs), $deadline, true, $batch,
+                max(1, $gap), null, $collect);
+        } catch (CashuException $e) {
+            // The keyset list itself could not be read: no progress, nothing changed.
+            $this->storage?->recordRestoreError(null, $e->getMessage());
+            $status = $this->getRestoreStatus();
+            return [
+                'status' => 'error',
+                'progress' => $status['progress'],
+                'error' => $e->getMessage(),
+                'errors' => ['mint' => $e->getMessage()],
+                'recovered' => $collect['recovered'],
+                'skippedKeysets' => [],
+                'gap' => $status['gap'],
+                'ready' => $status['ready'],
             ];
         }
+        return $step + ['ready' => !$this->requiresRecovery()];
+    }
 
-        if (empty($outputs)) {
-            return [];
+    /**
+     * Progress of the current or last restore session, without contacting the mint.
+     *
+     * @return array{status: string, ready: bool, progress: array, error: ?string, gap: int,
+     *               unknownProofs: int, startedAt: ?int, updatedAt: ?int, provenance: ?array}
+     *         status: 'none' (never started), 'pending', 'error' (last step failed), 'complete'
+     */
+    public function getRestoreStatus(): array
+    {
+        if ($this->storage) {
+            $raw = $this->storage->getRestoreProgress();
+            $provenance = $this->storage->getSeedProvenance();
+        } else {
+            $raw = $this->memoryRestore ?? ['status' => 'none', 'gap' => null, 'keysets' => [],
+                'error' => null, 'started_at' => null, 'updated_at' => null, 'unknown_proofs' => 0];
+            $provenance = null;
         }
+        $gap = (int)($raw['gap'] ?? self::RESTORE_GAP);
+        $status = match ($raw['status']) {
+            'complete' => 'complete',
+            'in_progress' => $raw['error'] !== null ? 'error' : 'pending',
+            default => 'none',
+        };
+        return [
+            'status' => $status,
+            'ready' => $this->hasSeed() ? !$this->requiresRecovery() : (bool)($provenance['ready'] ?? false),
+            'progress' => self::formatRestoreProgress($raw['keysets'], $gap),
+            'error' => $raw['error'],
+            'gap' => $gap,
+            'unknownProofs' => (int)$raw['unknown_proofs'],
+            'startedAt' => $raw['started_at'],
+            'updatedAt' => $raw['updated_at'],
+            'provenance' => $provenance,
+        ];
+    }
 
-        // POST to /v1/restore
-        $response = $this->client->post('restore', ['outputs' => $outputs]);
+    private static function formatRestoreProgress(array $rows, int $gap): array
+    {
+        $progress = [];
+        foreach ($rows as $keysetId => $row) {
+            $progress[$keysetId] = [
+                'unit' => $row['unit'],
+                'nextCounter' => $row['next_counter'],
+                'highestSigned' => $row['highest_signed'],
+                'emptyRun' => $row['empty_run'],
+                'done' => $row['empty_run'] >= $gap,
+                'error' => $row['error'],
+            ];
+        }
+        return $progress;
+    }
 
-        // Process returned signatures
-        $proofs = [];
-        $returnedOutputs = $response['outputs'] ?? [];
-        $returnedSignatures = $response['signatures'] ?? [];
+    private static function emptyRestoreCollection(): array
+    {
+        return [
+            'proofs' => [],
+            'byUnit' => [],
+            'errors' => [],
+            'recovered' => ['outputs' => 0, 'proofs' => 0, 'unspent' => 0, 'amount' => 0,
+                'spent' => 0, 'unknown' => 0, 'zeroAmount' => 0],
+        ];
+    }
 
-        for ($i = 0; $i < count($returnedSignatures); $i++) {
-            $sig = $returnedSignatures[$i];
-            $output = $returnedOutputs[$i] ?? null;
+    /** Load (or begin) the restore session and return its gap and per-keyset rows. */
+    private function openRestoreSession(int $gap): array
+    {
+        if ($this->storage) {
+            $progress = $this->storage->getRestoreProgress();
+            if ($progress['status'] !== 'in_progress') {
+                $this->storage->beginRestoreSession($gap);
+                return ['gap' => $gap, 'rows' => []];
+            }
+            if ($progress['gap'] === null || $progress['gap'] < $gap) {
+                $this->storage->setRestoreGap($gap);
+            }
+            return ['gap' => max($gap, (int)$progress['gap']), 'rows' => $progress['keysets']];
+        }
+        if ($this->memoryRestore === null || $this->memoryRestore['status'] !== 'in_progress') {
+            $this->memoryRestore = ['status' => 'in_progress', 'gap' => $gap, 'keysets' => [],
+                'error' => null, 'started_at' => time(), 'updated_at' => time(), 'unknown_proofs' => 0];
+        }
+        $this->memoryRestore['gap'] = max($gap, (int)$this->memoryRestore['gap']);
+        return ['gap' => $this->memoryRestore['gap'], 'rows' => $this->memoryRestore['keysets']];
+    }
 
-            if ($sig === null || !isset($sig['C_']) || $output === null) {
+    /** Ensure keys of a keyset being scanned are loaded; returns an error message or null. */
+    private function loadRestoreKeys(string $keysetId): ?string
+    {
+        if (isset($this->keys[$keysetId])) {
+            return null;
+        }
+        try {
+            $this->ensureKeysetKeys($keysetId);
+        } catch (CashuException $e) {
+            // Old/deprecated keyset or a transient failure — we cannot tell them apart.
+            // Its counters stay unscanned, so the wallet must not become ready.
+            return $e->getMessage();
+        }
+        return isset($this->keys[$keysetId]) ? null : 'Mint returned no keys for this keyset';
+    }
+
+    /**
+     * The restore engine behind restore() and restoreStep().
+     *
+     * @param array $collect Accumulates proofs/byUnit/errors/recovered for the caller
+     */
+    private function runRestore(
+        int $maxOutputs,
+        ?float $deadline,
+        bool $allUnits,
+        int $batchSize,
+        int $gap,
+        ?callable $progressCallback,
+        array &$collect
+    ): array {
+        $batchSize = max(1, $batchSize);
+        $gap = max(1, $gap);
+
+        // The keyset plan: every keyset of every unit (a seed is not owned by one unit).
+        $keysetsResponse = $this->client->get('keysets');
+        if (!is_array($keysetsResponse['keysets'] ?? null)) {
+            // An envelope without a keyset list is not "this seed has no history"; it is
+            // an answer we could not read. Scanning nothing and declaring the wallet ready
+            // would restart issuance at counter 0 over previously used secrets.
+            throw new CashuException('Mint did not return a keyset list; cannot restore safely');
+        }
+        $plan = [];
+        $skipped = [];
+        foreach ($keysetsResponse['keysets'] as $ks) {
+            if (!is_array($ks) || !is_string($ks['id'] ?? null) || $ks['id'] === '') {
+                throw new CashuException('Mint returned a malformed keyset list; cannot restore safely');
+            }
+            $unit = is_string($ks['unit'] ?? null) ? $ks['unit'] : 'sat';
+            if (!$allUnits && $unit !== $this->unit) {
                 continue;
             }
-
-            $B_ = $output['B_'];
-            if (!isset($blindingData[$B_])) {
+            // A keyset whose ID version we cannot derive secrets for never received
+            // outputs from this wallet, so it holds nothing to restore.
+            if (!self::canDeriveSecretsFor($ks['id'])) {
+                $skipped[] = $ks['id'];
                 continue;
             }
-
-            $data = $blindingData[$B_];
-
-            // Unblind the signature
-            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
-            $C = Crypto::unblindSignature($sig['C_'], $data['r'], $pubkey);
-
-            $proofs[] = new Proof(
-                $sig['id'],
-                $sig['amount'],
-                $data['secret'],
-                $C
-            );
+            $plan[$ks['id']] = $unit;
+        }
+        if (empty($plan)) {
+            // Nothing to scan proves nothing: fail closed rather than ready counter 0.
+            throw new CashuException('Mint announced no keysets this wallet can scan; cannot restore safely');
         }
 
-        return $proofs;
+        $session = $this->openRestoreSession($gap);
+        $gap = $session['gap'];
+        $rows = $session['rows'];
+        foreach ($plan as $keysetId => $unit) {
+            if (!isset($rows[$keysetId])) {
+                $this->storage?->ensureRestoreKeyset($keysetId, $unit);
+                $rows[$keysetId] = ['unit' => $unit, 'next_counter' => 0, 'highest_signed' => null,
+                    'empty_run' => 0, 'done' => false, 'error' => null, 'updated_at' => time()];
+                if (!$this->storage) {
+                    $this->memoryRestore['keysets'][$keysetId] = $rows[$keysetId];
+                }
+            }
+        }
+
+        $fingerprint = $this->storage?->getSeedFingerprint();
+        $used = 0;
+        $failed = [];
+        $verifyErrors = [];
+        $budgetExhausted = false;
+
+        foreach ($plan as $keysetId => $unit) {
+            if ($rows[$keysetId]['empty_run'] >= $gap) {
+                continue;
+            }
+            if ($budgetExhausted) {
+                break;
+            }
+            $keyError = $this->loadRestoreKeys($keysetId);
+            if ($keyError !== null) {
+                $failed[$keysetId] = $keyError;
+                continue;
+            }
+            $unitStorage = $this->storage?->forUnit($unit);
+
+            while ($rows[$keysetId]['empty_run'] < $gap) {
+                if ($used >= $maxOutputs || ($used > 0 && $deadline !== null && microtime(true) >= $deadline)) {
+                    $budgetExhausted = true;
+                    break;
+                }
+                $row = $rows[$keysetId];
+                $from = $row['next_counter'];
+                $size = min($batchSize, $maxOutputs - $used, $gap - $row['empty_run']);
+                try {
+                    $scan = $this->scanRestoreRange($keysetId, $from, $size, $deadline);
+                } catch (CashuException $e) {
+                    // Mint error or a reply that failed validation: nothing from this
+                    // batch is trusted or stored, and the keyset stays incomplete.
+                    $failed[$keysetId] = $e->getMessage();
+                    break;
+                }
+                $used += $scan['scanned'];
+
+                $next = $from + $scan['scanned'];
+                $highest = $row['highest_signed'];
+                if ($scan['highest'] !== null && ($highest === null || $scan['highest'] > $highest)) {
+                    $highest = $scan['highest'];
+                }
+                $emptyRun = $highest === null ? $next : $next - ($highest + 1);
+                $done = $emptyRun >= $gap;
+
+                [$unspent, $spent, $unknown, $verifyError] = $this->classifyRestoredProofs($scan['found']);
+
+                if ($this->storage) {
+                    try {
+                        $advanced = $this->storage->applyRestoreBatch(
+                            $unitStorage, $keysetId, $from, $next, $highest, $emptyRun, $done,
+                            $unspent, $spent, $unknown, $fingerprint
+                        );
+                    } catch (CashuException $e) {
+                        $failed[$keysetId] = $e->getMessage();
+                        break;
+                    }
+                    if (!$advanced) {
+                        // Another process moved this cursor; continue from where it is.
+                        $fresh = $this->storage->getRestoreProgress()['keysets'][$keysetId] ?? null;
+                        if ($fresh === null) {
+                            $failed[$keysetId] = 'Restore session was restarted concurrently';
+                            break;
+                        }
+                        $rows[$keysetId] = $fresh;
+                    } else {
+                        $rows[$keysetId] = ['next_counter' => $next, 'highest_signed' => $highest,
+                            'empty_run' => $emptyRun, 'done' => $done, 'error' => null] + $row;
+                    }
+                } else {
+                    $rows[$keysetId] = ['next_counter' => $next, 'highest_signed' => $highest,
+                        'empty_run' => $emptyRun, 'done' => $done, 'error' => null] + $row;
+                    $this->memoryRestore['keysets'][$keysetId] = $rows[$keysetId];
+                    $this->memoryRestore['updated_at'] = time();
+                }
+
+                // Report what this batch recovered.
+                $foundProofs = array_map(fn($f) => $f['proof'], $scan['found']);
+                $collect['recovered']['outputs'] += $scan['scanned'];
+                $collect['recovered']['zeroAmount'] += $scan['zero'];
+                $collect['recovered']['proofs'] += count($foundProofs);
+                $collect['recovered']['unspent'] += count($unspent);
+                $collect['recovered']['amount'] += self::sumProofs($unspent);
+                $collect['recovered']['spent'] += count($spent);
+                $collect['recovered']['unknown'] += count($unknown);
+                if (!empty($foundProofs)) {
+                    $collect['proofs'] = array_merge($collect['proofs'], $foundProofs);
+                    $byUnit = $collect['byUnit'][$unit] ?? ['proofs' => [], 'counters' => [],
+                        'unspent' => [], 'spent' => [], 'unknown' => []];
+                    $byUnit['proofs'] = array_merge($byUnit['proofs'], $foundProofs);
+                    $byUnit['unspent'] = array_merge($byUnit['unspent'], $unspent);
+                    $byUnit['spent'] = array_merge($byUnit['spent'], $spent);
+                    $byUnit['unknown'] = array_merge($byUnit['unknown'], $unknown);
+                    $collect['byUnit'][$unit] = $byUnit;
+                }
+                if ($verifyError !== null) {
+                    $verifyErrors[$unit] = $verifyError;
+                }
+                if ($progressCallback) {
+                    $progressCallback($keysetId, $from, count($foundProofs), $unit);
+                }
+            }
+        }
+
+        foreach ($failed as $keysetId => $message) {
+            $collect['errors'][$keysetId] = $message;
+            $rows[$keysetId]['error'] = $message;
+            $this->storage?->recordRestoreError($keysetId, $message);
+            if (!$this->storage && isset($this->memoryRestore['keysets'][$keysetId])) {
+                $this->memoryRestore['keysets'][$keysetId]['error'] = $message;
+            }
+        }
+        foreach ($verifyErrors as $unit => $message) {
+            $collect['errors'][$unit] = $message;
+        }
+
+        $allDone = empty($failed);
+        foreach ($plan as $keysetId => $unit) {
+            if ($rows[$keysetId]['empty_run'] < $gap) {
+                $allDone = false;
+            }
+        }
+
+        $status = 'pending';
+        $error = null;
+        if (!empty($failed)) {
+            $status = 'error';
+            $error = reset($failed);
+            if (!$this->storage) {
+                $this->memoryRestore['error'] = $error;
+            }
+        } elseif ($allDone) {
+            [$status, $error] = $this->finishRestore($plan, $collect);
+        } else {
+            $this->storage?->recordRestoreError(null, null);
+            if (!$this->storage) {
+                $this->memoryRestore['error'] = null;
+            }
+        }
+
+        // Keep the in-memory counter cache in step with what the scan established.
+        if ($this->storage) {
+            $this->counters = $this->storage->getAllCounters();
+        }
+        foreach ($rows as $keysetId => $row) {
+            if (isset($plan[$keysetId]) && $row['highest_signed'] !== null) {
+                $this->counters[$keysetId] = max($this->counters[$keysetId] ?? 0, $row['highest_signed'] + 1);
+            }
+        }
+
+        $progressRows = [];
+        foreach ($plan as $keysetId => $unit) {
+            $progressRows[$keysetId] = $rows[$keysetId];
+        }
+        return [
+            'status' => $status,
+            'progress' => self::formatRestoreProgress($progressRows, $gap),
+            'error' => $error,
+            'errors' => $collect['errors'],
+            'recovered' => $collect['recovered'],
+            'skippedKeysets' => $skipped,
+            'gap' => $gap,
+        ];
+    }
+
+    /**
+     * Every keyset is scanned: verify outstanding proof states, then let the storage
+     * finalizer mark the account (and its sibling units) ready.
+     *
+     * @return array{0: string, 1: ?string} status and error
+     */
+    private function finishRestore(array $plan, array &$collect): array
+    {
+        $units = array_values(array_unique(array_values($plan)));
+        if (!$this->storage) {
+            // Without storage an UNKNOWN proof cannot be re-checked later.
+            if ($collect['recovered']['unknown'] > 0) {
+                $error = 'Restored proofs could not be verified with the mint';
+                $this->memoryRestore['error'] = $error;
+                return ['error', $error];
+            }
+            $this->memoryRestore['status'] = 'complete';
+            $this->memoryRestore['error'] = null;
+            return ['complete', null];
+        }
+
+        $units[] = $this->unit;
+        $units = array_values(array_unique($units));
+        foreach ($units as $unit) {
+            $unitStorage = $this->storage->forUnit($unit);
+            if ($unitStorage->countProofsInState(ProofState::UNKNOWN) === 0) {
+                continue;
+            }
+            $reconciled = $this->reconcileUnknownIn($unitStorage);
+            if ($reconciled['error'] !== null) {
+                $collect['errors'][$unit] = $reconciled['error'];
+            }
+        }
+        try {
+            $this->storage->finalizeRecovery(array_keys($plan), $units);
+        } catch (CashuException $e) {
+            $this->storage->recordRestoreError(null, $e->getMessage());
+            $collect['errors']['verification'] = $e->getMessage();
+            return ['error', $e->getMessage()];
+        }
+        return ['complete', null];
     }
 
     /**
@@ -5186,27 +8499,26 @@ class Wallet
      * Restores proofs from the mint by scanning all keysets for secrets derived
      * from this wallet's seed. By default, restores ALL units from the mint.
      *
-     * WARNING: Setting $allUnits to false is dangerous and can cause PROOF REUSE.
-     * Melt operations (Lightning withdrawals) return fee reserve change in sats,
-     * regardless of the original token's unit. For example, melting EUR tokens
-     * returns leftover fees as sat proofs. If you only restore EUR, those sat
-     * proofs are missed, and their counter values may be reused when you later
-     * mint sats - generating duplicate secrets and losing funds.
+     * Runs restoreStep()'s resumable engine without a budget: an unfinished earlier
+     * session (timeout, crash, restoreStep() calls) is resumed rather than restarted,
+     * and a finished one is followed by a fresh scan. On BCMath-only hosts prefer
+     * bounded restoreStep() calls.
      *
-     * Always restore all units unless you are certain no cross-unit operations
-     * (like melt) have ever been performed with this seed.
+     * WARNING: Setting $allUnits to false is dangerous and can cause PROOF REUSE:
+     * a seed is not owned by one unit, and skipping units leaves their counters
+     * unscanned so the next issuance can reuse a secret.
      *
      * @param int $batchSize Number of counters to check per batch
-     * @param int $emptyBatches Stop after this many consecutive empty batches
+     * @param int $emptyBatches Stop after $batchSize * $emptyBatches consecutive unsigned counters
      * @param callable|null $progressCallback Called with (keysetId, counter, proofsFound, unit)
      * @param bool $allUnits Restore ALL units from the mint. Default true.
-     *                       WARNING: Setting to false risks proof reuse - see above.
-     * @return array ['proofs' => Proof[], 'counters' => array, 'byUnit' => array]
-     *               'byUnit' contains ['unit' => ['proofs' => [], 'counters' => []]]
+     * @return array ['proofs' => Proof[], 'counters' => array, 'byUnit' => array, 'skippedKeysets',
+     *               'incomplete', 'errors', 'status', 'progress'] — proofs found by earlier
+     *               sessions or steps are in storage, not in 'proofs'.
      */
     public function restore(
-        int $batchSize = 25,
-        int $emptyBatches = 3,
+        int $batchSize = 100,
+        int $emptyBatches = 5,
         ?callable $progressCallback = null,
         bool $allUnits = true
     ): array {
@@ -5214,172 +8526,38 @@ class Wallet
             throw new CashuException('Cannot restore: wallet not initialized with seed');
         }
 
-        $allProofs = [];
-        $finalCounters = [];
-        $byUnit = [];
+        $batchSize = max(1, $batchSize);
+        $gap = $batchSize * max(1, $emptyBatches);
+        $collect = self::emptyRestoreCollection();
+        $attempts = 0;
+        do {
+            $step = $this->runRestore(PHP_INT_MAX, null, $allUnits, $batchSize, $gap, $progressCallback, $collect);
+        } while ($step['status'] === 'pending' && ++$attempts < 1000);
 
-        // Get all keysets from the mint
-        $keysetsResponse = $this->client->get('keysets');
-
-        // Group keysets by unit
-        $keysetsByUnit = [];
-        foreach ($keysetsResponse['keysets'] ?? [] as $ks) {
-            $unit = $ks['unit'] ?? 'sat';
-
-            // If not restoring all units, skip units that don't match
-            if (!$allUnits && $unit !== $this->unit) {
-                continue;
-            }
-
-            if (!isset($keysetsByUnit[$unit])) {
-                $keysetsByUnit[$unit] = [];
-            }
-            $keysetsByUnit[$unit][] = $ks;
-        }
-
-        // Process each unit
-        foreach ($keysetsByUnit as $unit => $keysets) {
-            $unitProofs = [];
-            $unitCounters = [];
-
-            // Load keys for each keyset in this unit
-            foreach ($keysets as $ks) {
-                $keysetId = $ks['id'];
-
-                // Load keys for this keyset if not already loaded
-                if (!isset($this->keys[$keysetId])) {
-                    try {
-                        // URL-encode keyset ID in case it contains special characters like /
-                        $keysResponse = $this->client->get('keys/' . urlencode($keysetId));
-                        foreach ($keysResponse['keysets'] ?? [] as $keysetData) {
-                            if ($keysetData['id'] === $keysetId) {
-                                $keys = [];
-                                foreach ($keysetData['keys'] ?? [] as $amount => $pubkey) {
-                                    $amountStr = (string)$amount;
-                                    $maxStr = (string)PHP_INT_MAX;
-                                    if (strlen($amountStr) < strlen($maxStr) ||
-                                        (strlen($amountStr) === strlen($maxStr) && $amountStr <= $maxStr)) {
-                                        $keys[(int)$amount] = $pubkey;
-                                    }
-                                }
-                                $this->keys[$keysetId] = $keys;
-                            }
-                        }
-                    } catch (CashuProtocolException $e) {
-                        // Skip this keyset - keys not available (old/deprecated keyset)
-                        continue;
-                    }
-                }
-
-                // Scan this keyset
-                $counter = 0;
-                $emptyCount = 0;
-                $keysetProofs = [];
-
-                while ($emptyCount < $emptyBatches) {
-                    $proofs = $this->restoreBatch($keysetId, $counter, $batchSize);
-
-                    if ($progressCallback) {
-                        $progressCallback($keysetId, $counter, count($proofs), $unit);
-                    }
-
-                    if (empty($proofs)) {
-                        $emptyCount++;
-                    } else {
-                        $emptyCount = 0;
-                        $keysetProofs = array_merge($keysetProofs, $proofs);
-                    }
-
-                    $counter += $batchSize;
-                }
-
-                if (!empty($keysetProofs)) {
-                    $unitProofs = array_merge($unitProofs, $keysetProofs);
-                    $allProofs = array_merge($allProofs, $keysetProofs);
-                    // Set counter to the last found + 1
-                    $maxCounter = $counter - ($emptyBatches * $batchSize);
-                    $unitCounters[$keysetId] = $maxCounter + count($keysetProofs);
-                    $finalCounters[$keysetId] = $unitCounters[$keysetId];
-                }
-            }
-
-            // Store results for this unit
-            if (!empty($unitProofs)) {
-                // Check proof states at mint before storing (NUT-07)
-                // This ensures we don't store spent proofs as UNSPENT
-                $unspentProofs = $unitProofs;
-                $spentProofs = [];
-
-                try {
-                    // Build Y values for batch check
-                    $Ys = [];
-                    foreach ($unitProofs as $proof) {
-                        $Y = Crypto::hashToCurve($proof->secret);
-                        $Ys[] = bin2hex(Secp256k1::compressPoint($Y));
-                    }
-
-                    // Check states at mint
-                    $response = $this->client->post('checkstate', ['Ys' => $Ys]);
-
-                    // Separate into unspent and spent
-                    $unspentProofs = [];
-                    $spentProofs = [];
-                    foreach ($response['states'] ?? [] as $i => $state) {
-                        // Normalize case - mints may return lowercase states
-                        $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
-                        if (isset($unitProofs[$i])) {
-                            if ($mintState === ProofState::SPENT) {
-                                $spentProofs[] = $unitProofs[$i];
-                            } else {
-                                $unspentProofs[] = $unitProofs[$i];
-                            }
-                        }
-                    }
-                } catch (\Exception $e) {
-                    // If checkstate fails, store all as UNSPENT (will be synced later)
-                    // This maintains backwards compatibility
-                }
-
-                $byUnit[$unit] = [
-                    'proofs' => $unitProofs,  // Return all found proofs
-                    'counters' => $unitCounters,
-                    'unspent' => $unspentProofs,
-                    'spent' => $spentProofs,
-                ];
-
-                // Store proofs and counters for this unit
-                if ($this->dbPath !== null) {
-                    // Create storage for this unit (may be different from wallet's primary unit)
-                    $unitStorage = new WalletStorage($this->dbPath, $this->mintUrl, $unit);
-
-                    // Store unspent proofs as UNSPENT
-                    if (!empty($unspentProofs)) {
-                        $unitStorage->storeProofs($unspentProofs);
-                    }
-
-                    // Store spent proofs as SPENT (for record-keeping)
-                    if (!empty($spentProofs)) {
-                        $unitStorage->storeProofs($spentProofs);
-                        $spentSecrets = array_map(fn($p) => $p->secret, $spentProofs);
-                        $unitStorage->updateProofsState($spentSecrets, ProofState::SPENT);
-                    }
-
-                    foreach ($unitCounters as $keysetId => $counterVal) {
-                        $unitStorage->setCounter($keysetId, $counterVal);
-                    }
-                }
+        $counters = [];
+        foreach ($step['progress'] as $keysetId => $row) {
+            if ($row['highestSigned'] !== null) {
+                $counters[$keysetId] = $row['highestSigned'] + 1;
             }
         }
-
-        // Update internal counters for this wallet's unit
-        foreach ($finalCounters as $keysetId => $counter) {
-            $this->counters[$keysetId] = $counter;
+        $byUnit = $collect['byUnit'];
+        foreach ($byUnit as $unit => $data) {
+            foreach ($step['progress'] as $keysetId => $row) {
+                if ($row['unit'] === $unit && isset($counters[$keysetId])) {
+                    $byUnit[$unit]['counters'][$keysetId] = $counters[$keysetId];
+                }
+            }
         }
 
         return [
-            'proofs' => $allProofs,
-            'counters' => $finalCounters,
+            'incomplete' => $step['status'] !== 'complete',
+            'errors' => $step['errors'],
+            'proofs' => $collect['proofs'],
+            'counters' => $counters,
             'byUnit' => $byUnit,
+            'skippedKeysets' => $step['skippedKeysets'],
+            'status' => $step['status'],
+            'progress' => $step['progress'],
         ];
     }
 
@@ -5564,22 +8742,47 @@ class Wallet
      * @throws CashuException If sending fails
      */
     private function sendTokenViaHttp(string $token, string $url): void {
+        // The transport target comes from a third party's payment request: only
+        // plain HTTPS, no redirects, and the host application's address policy
+        // (checked before any handle is opened).
+        $parts = parse_url($url);
+        if ($parts === false || strtolower($parts['scheme'] ?? '') !== 'https'
+            || !isset($parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+            throw new CashuException('Refusing to send a token to a non-HTTPS transport URL');
+        }
+        $guardOptions = ConnectGuard::curlOptions($url, 'http');
+
+        $body = '';
+        $tooLarge = false;
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode(['token' => $token]),
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_TIMEOUT => 30,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
-        ]);
+            CURLOPT_USERAGENT => 'cashu-wallet-php',
+            CURLOPT_WRITEFUNCTION => function ($handle, string $chunk) use (&$body, &$tooLarge) {
+                $body .= $chunk;
+                if (strlen($body) > 262144) {
+                    $tooLarge = true;
+                    return 0;
+                }
+                return strlen($chunk);
+            },
+        ] + $guardOptions + MintClient::curlProtocolOptions());
 
-        $response = curl_exec($ch);
+        curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
         // Note: curl_close() not needed since PHP 8.0 - handle auto-closes
+        if ($tooLarge) {
+            throw new CashuException('Failed to send token: response too large');
+        }
 
         if ($error) {
             throw new CashuException("Failed to send token: $error");
@@ -5705,36 +8908,29 @@ class LightningAddress
         // set, use it as a sprintf-style template — supports {user} and {domain}
         // substitutions. This is for test environments that need to point the
         // resolver at a non-https host or a non-443 port; no-op in production.
+        // The template URL (and the callback it hands out) is exempt from the
+        // HTTPS-only rule but still goes through the ConnectGuard address policy.
         $template = getenv('CASHU_LNURL_URL_TEMPLATE');
-        if ($template !== false && $template !== '') {
+        $insecureOk = $template !== false && $template !== '';
+        if ($insecureOk) {
             $url = strtr($template, ['{user}' => $username, '{domain}' => $domain]);
         } else {
-            $url = "https://{$domain}/.well-known/lnurlp/{$username}";
+            $url = "https://{$domain}/.well-known/lnurlp/" . rawurlencode($username);
         }
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
-        ]);
-
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if ($httpCode !== 200 || empty($response)) {
+        try {
+            $data = self::fetchJson($url, 10, $insecureOk);
+        } catch (CashuException $e) {
             return null;
         }
 
-        $data = json_decode($response, true);
-
         // Validate LNURL-pay response
-        if (!isset($data['callback']) || !isset($data['minSendable']) || !isset($data['maxSendable'])) {
+        if (!isset($data['callback']) || !is_string($data['callback'])
+            || !isset($data['minSendable']) || !isset($data['maxSendable'])
+            || !is_numeric($data['minSendable']) || !is_numeric($data['maxSendable'])) {
+            return null;
+        }
+        if (!self::isSafeCallbackUrl($data['callback'], $insecureOk)) {
             return null;
         }
 
@@ -5742,10 +8938,95 @@ class LightningAddress
             'callback' => $data['callback'],
             'minSendable' => (int)$data['minSendable'],
             'maxSendable' => (int)$data['maxSendable'],
-            'metadata' => $data['metadata'] ?? '',
-            'commentAllowed' => (int)($data['commentAllowed'] ?? 0),
-            'tag' => $data['tag'] ?? 'payRequest',
+            'metadata' => is_string($data['metadata'] ?? null) ? $data['metadata'] : '',
+            'commentAllowed' => is_numeric($data['commentAllowed'] ?? null) ? (int)$data['commentAllowed'] : 0,
+            'tag' => is_string($data['tag'] ?? null) ? $data['tag'] : 'payRequest',
         ];
+    }
+
+    /**
+     * LUD-01: LNURL endpoints are HTTPS, except .onion hosts which may use HTTP.
+     * Anything else (file://, gopher://, a plain-HTTP internal host) is a way to turn
+     * an attacker-supplied callback into a request from this server.
+     *
+     * @param bool $allowHttp Test seam (CASHU_LNURL_URL_TEMPLATE): plain http is accepted
+     */
+    public static function isSafeCallbackUrl(string $url, bool $allowHttp = false): bool
+    {
+        $parts = parse_url($url);
+        if ($parts === false || !isset($parts['scheme'], $parts['host']) || $parts['host'] === ''
+            || isset($parts['user']) || isset($parts['pass'])) {
+            return false;
+        }
+        $scheme = strtolower($parts['scheme']);
+        if ($scheme === 'https') {
+            return true;
+        }
+        return $scheme === 'http' && ($allowHttp || str_ends_with(strtolower($parts['host']), '.onion'));
+    }
+
+    /** Largest LNURL response body accepted. */
+    private const MAX_RESPONSE_BYTES = 262144;
+
+    /**
+     * Fetch and decode a JSON document from an LNURL endpoint.
+     *
+     * Redirects are not followed: the redirect target is chosen by the same third party
+     * and would bypass the scheme check above. The host application's ConnectGuard is
+     * consulted before any handle is opened (purpose 'lnurl').
+     *
+     * @throws CashuException on transport, size or decoding failure
+     */
+    private static function fetchJson(string $url, int $timeout, bool $allowHttp = false): array
+    {
+        if (!self::isSafeCallbackUrl($url, $allowHttp)) {
+            throw new CashuException('Refusing to fetch a non-HTTPS LNURL endpoint');
+        }
+
+        $guardOptions = ConnectGuard::curlOptions($url, 'lnurl');
+
+        $body = '';
+        $tooLarge = false;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+            CURLOPT_USERAGENT => 'cashu-wallet-php',
+            CURLOPT_WRITEFUNCTION => function ($handle, string $chunk) use (&$body, &$tooLarge) {
+                $body .= $chunk;
+                if (strlen($body) > self::MAX_RESPONSE_BYTES) {
+                    $tooLarge = true;
+                    return 0; // aborts the transfer
+                }
+                return strlen($chunk);
+            },
+        ] + $guardOptions + MintClient::curlProtocolOptions());
+
+        curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+
+        if ($tooLarge) {
+            throw new CashuException('LNURL response too large');
+        }
+        if ($error !== '' && $body === '') {
+            throw new CashuException("LNURL request failed: {$error}");
+        }
+        if ($httpCode !== 200 || $body === '') {
+            throw new CashuException("LNURL request failed with HTTP {$httpCode}");
+        }
+
+        $data = json_decode($body, true);
+        if (!is_array($data)) {
+            throw new CashuException('LNURL endpoint returned invalid JSON');
+        }
+
+        return $data;
     }
 
     /**
@@ -5761,6 +9042,10 @@ class LightningAddress
      */
     public static function getInvoice(string $address, int $amountSats, ?string $comment = null): string
     {
+        if ($amountSats <= 0) {
+            throw new CashuException('Lightning address amount must be positive');
+        }
+
         $metadata = self::resolve($address);
         if ($metadata === null) {
             throw new CashuException("Failed to resolve Lightning address: {$address}");
@@ -5791,33 +9076,77 @@ class LightningAddress
             $callbackUrl .= '&comment=' . urlencode($comment);
         }
 
-        // Request invoice
-        $ch = curl_init($callbackUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
-        ]);
-
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if ($httpCode !== 200 || empty($response)) {
-            throw new CashuException("Failed to get invoice from Lightning address");
+        // Request invoice (the callback is a third-party URL: no redirects, size cap,
+        // address policy; plain http only under the CASHU_LNURL_URL_TEMPLATE test seam)
+        $template = getenv('CASHU_LNURL_URL_TEMPLATE');
+        $insecureOk = $template !== false && $template !== '';
+        try {
+            $data = self::fetchJson($callbackUrl, 15, $insecureOk);
+        } catch (CashuException $e) {
+            throw new CashuException('Failed to get invoice from Lightning address: ' . $e->getMessage());
         }
 
-        $data = json_decode($response, true);
-
-        if (!isset($data['pr'])) {
+        if (!isset($data['pr']) || !is_string($data['pr'])) {
             $error = $data['reason'] ?? $data['message'] ?? 'Unknown error';
-            throw new CashuException("Lightning address error: {$error}");
+            throw new CashuException("Lightning address error: " . (is_string($error) ? $error : 'Unknown error'));
+        }
+
+        // The callback is a third party and the melt that follows pays whatever the
+        // invoice says, not what we asked for: the invoice's own amount must match.
+        $invoiceAmount = Bolt11::amountSats($data['pr']);
+        if ($invoiceAmount !== $amountSats) {
+            throw new CashuException(
+                "Lightning address returned an invoice for {$invoiceAmount} sats, expected {$amountSats}"
+            );
         }
 
         return $data['pr'];
+    }
+}
+
+/**
+ * Minimal BOLT11 helpers.
+ *
+ * Only the human-readable part is parsed: that is where the amount lives, and the
+ * amount is the field a wallet must not take on trust from a payee's callback.
+ */
+class Bolt11
+{
+    /**
+     * Amount encoded in a BOLT11 invoice, in satoshis.
+     *
+     * @return int Satoshis, or 0 for an amountless invoice or an unparseable string
+     */
+    public static function amountSats(string $bolt11): int
+    {
+        $bolt11 = strtolower(trim($bolt11));
+        if (str_starts_with($bolt11, 'lightning:')) {
+            $bolt11 = substr($bolt11, 10);
+        }
+
+        // ln<network><amount><multiplier>1<data>
+        if (!preg_match('/^ln(bcrt|tbs|bc|tb)(\d*)([munp]?)1/', $bolt11, $m)) {
+            return 0;
+        }
+        if ($m[2] === '') {
+            return 0; // amountless invoice
+        }
+
+        // Value in pico-BTC, so every multiplier divides evenly and no float is involved.
+        // BigInt (GMP or BCMath) rather than bc* directly: the library promises either.
+        $picoPerSat = 10000;
+        $multiplier = match ($m[3]) {
+            '' => '1000000000000',
+            'm' => '1000000000',
+            'u' => '1000000',
+            'n' => '1000',
+            'p' => '1',
+        };
+        $pico = BigInt::fromDec(ltrim($m[2], '0') ?: '0')->mul(BigInt::fromDec($multiplier));
+
+        // BOLT11 rounds sub-satoshi amounts up: the payer must not underpay.
+        $sats = $pico->add(BigInt::fromDec($picoPerSat - 1))->div(BigInt::fromDec($picoPerSat))->toDec();
+
+        return strlen($sats) > 18 ? PHP_INT_MAX : (int)$sats;
     }
 }
